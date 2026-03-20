@@ -46,8 +46,9 @@ TEMP_FOLDER   = r"C:\Varsany\Temp"
 for _d in [UPLOAD_FOLDER, OUTPUT_FOLDER, FONTS_FOLDER, TEMP_FOLDER]:
     os.makedirs(_d, exist_ok=True)
 
-PX_PER_CM = 320
-DPI        = int(PX_PER_CM * 2.54)   # 812
+# LOW-RES MODE  — change back to 320 (812 DPI) when ready for production
+PX_PER_CM = 28                        # ≈72 DPI: canvas ~840px for 30cm zone
+DPI        = int(PX_PER_CM * 2.54)   # ~71
 
 def cm_to_px(cm): return int(round(cm * PX_PER_CM))
 
@@ -208,18 +209,34 @@ def get_recent_orders():
 # ratio on print-res images, keeping files well under 100 MB.
 
 def _pack_pascal_string(s: str) -> bytes:
-    """Pascal string: 1-byte length + bytes, padded to even length."""
+    """Pascal string padded to 2-byte boundary — used in Image Resources."""
     b = s.encode("latin-1")
-    length_byte = bytes([len(b)])
-    data = length_byte + b
+    data = bytes([len(b)]) + b
     if len(data) % 2 != 0:
         data += b'\x00'
     return data
 
 
+def _pack_layer_name(s: str) -> bytes:
+    """
+    Pascal string padded to 4-byte boundary — required for Layer Records.
+    PSD spec: "Layer name: Pascal string, padded to a multiple of 4 bytes."
+    Image resources use 2-byte padding; layer names use 4-byte padding.
+    """
+    b = s.encode("latin-1")
+    data = bytes([len(b)]) + b
+    pad = (4 - len(data) % 4) % 4
+    return data + b'\x00' * pad
+
+
 def _compress_channel_zip(channel_bytes: bytes) -> bytes:
-    """Deflate a raw channel using zlib (PSD compression mode 2 = ZIP no prediction)."""
-    return zlib.compress(channel_bytes, level=6)
+    """
+    Raw deflate for PSD compression mode 2 (ZIP without prediction).
+    PSD spec requires raw deflate with NO zlib wrapper (no 0x789C header,
+    no Adler-32 checksum). zlib.compress() adds both; wbits=-15 strips them.
+    """
+    obj = zlib.compressobj(level=6, method=zlib.DEFLATED, wbits=-15)
+    return obj.compress(channel_bytes) + obj.flush()
 
 
 def _pil_to_channels(pil_img: Image.Image, mode: str) -> dict:
@@ -284,7 +301,7 @@ def write_psd(out_path: str, canvas_w: int, canvas_h: int,
     # ResolutionInfo: hRes(fixed16.16), hResUnit(2=PPI), widthUnit,
     #                 vRes(fixed16.16), vResUnit(2=PPI), heightUnit
     dpi_fixed = (DPI << 16)  # convert int DPI to Fixed 16.16
-    res_data = struct.pack('>IHHIHh',
+    res_data = struct.pack('>IHHIHH',
         dpi_fixed, 1, 1,   # hRes, hResUnit=pixels/inch, widthUnit
         dpi_fixed, 1, 1    # vRes, vResUnit=pixels/inch, heightUnit
     )
@@ -322,20 +339,15 @@ def write_psd(out_path: str, canvas_w: int, canvas_h: int,
         channels = _pil_to_channels(img, 'RGBA')
         channel_order = [-1, 0, 1, 2]  # alpha first (PSD convention)
 
-        # Compress each channel
-        compressed = {}
-        for cid in channel_order:
-            raw = channels[cid]
-            compressed[cid] = _compress_channel_zip(raw)
-
         # Layer record
         lr = io.BytesIO()
         lr.write(struct.pack('>iiii', top, left, bottom, right))
         lr.write(struct.pack('>H', 4))   # num_channels = 4
 
         # Channel info: (channel_id int16, data_length uint32)
+        # data_length = raw bytes + 2 bytes for the compression type uint16 header
         for cid in channel_order:
-            data_len = len(compressed[cid]) + 2  # +2 for the compression type uint16
+            data_len = len(channels[cid]) + 2
             lr.write(struct.pack('>hI', cid, data_len))
 
         lr.write(b'8BIM')                           # blend mode signature
@@ -345,20 +357,26 @@ def write_psd(out_path: str, canvas_w: int, canvas_h: int,
         lr.write(struct.pack('>B', flags))          # flags
         lr.write(b'\x00')                           # filler
 
-        # Extra data: layer name + additional layer info
-        name_pascal = _pack_pascal_string(lname)
-        # No additional layer info blocks for simplicity
-        extra_data = name_pascal
+        # Extra data MUST contain three sub-sections in this exact order
+        # (per Adobe PSD spec) or Photoshop/GIMP report invalid mask info size:
+        #   1. Layer Mask / Adjustment data (4-byte length prefix, can be 0)
+        #   2. Layer Blending Ranges (4-byte length prefix, can be 0)
+        #   3. Layer Name (pascal string padded to 4-byte boundary — NOT 2-byte)
+        name_pascal  = _pack_layer_name(lname)   # 4-byte padded, per spec
+        layer_mask   = struct.pack('>I', 0)       # no mask data
+        blend_ranges = struct.pack('>I', 0)       # no blending ranges
+        extra_data   = layer_mask + blend_ranges + name_pascal
 
         lr.write(struct.pack('>I', len(extra_data)))
         lr.write(extra_data)
 
         layer_records_buf.write(lr.getvalue())
 
-        # Channel image data (written separately, same order as channel info)
+        # Channel image data — compression=0 (RAW), same as the merged composite.
+        # ZIP mode (2) needs per-row byte-count tables; omitting them corrupts the file.
         for cid in channel_order:
-            layer_data_buf.write(struct.pack('>H', 2))   # compression: 2=ZIP no prediction
-            layer_data_buf.write(compressed[cid])
+            layer_data_buf.write(struct.pack('>H', 0))   # compression: 0=raw
+            layer_data_buf.write(channels[cid])          # raw (uncompressed) bytes
 
     layer_records_bytes = layer_records_buf.getvalue()
     layer_data_bytes    = layer_data_buf.getvalue()
@@ -395,10 +413,12 @@ def write_psd(out_path: str, canvas_w: int, canvas_h: int,
 
     comp_channels = _pil_to_channels(composite, 'RGB')
 
-    # Write merged image: compression=2 (ZIP), then each channel deflated
-    p(struct.pack('>H', 2))  # compression type for merged image
+    # Write merged image: compression=0 (RAW/uncompressed) — safest for
+    # compatibility. ZIP mode (2) requires per-row byte count tables which
+    # were absent and caused Photoshop to report "unexpected end-of-file".
+    p(struct.pack('>H', 0))  # compression type: 0 = raw
     for cid in [0, 1, 2]:
-        p(_compress_channel_zip(comp_channels[cid]))
+        p(comp_channels[cid])
 
     # ── Write to file ──────────────────────────────────────────────────────────
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -703,7 +723,7 @@ tr:hover td{background:#1f1f1f}
     <div class="card">
       <div class="engine-note">
         <b>Engine:</b> Pure Python struct + zlib — zero NumPy, zero external tools.
-        Writes layered PSD using the Adobe spec directly. Files are 20–80 MB.
+        ⚠️ <b>LOW-RES MODE</b> (~72 DPI). Raise PX_PER_CM to 320 for production.
         Designers open in Photoshop: CustomerImage + CustomerText layers.
       </div>
       <h2>New Customisation Order</h2>
@@ -963,7 +983,8 @@ if __name__ == "__main__":
     print(f"\n{'='*55}")
     print(f"  Varsany Print Automation — Pure Python PSD Writer")
     print(f"  Engine: struct + zlib (zero NumPy)")
-    print(f"  Expected file size: 20-80 MB per order")
+    print(f"  Resolution: LOW-RES MODE ({PX_PER_CM} px/cm / {DPI} DPI)")
+    print(f"  Expected file size: 1-5 MB per order (raise PX_PER_CM=320 for prod)")
     print(f"  Open: http://localhost:5000")
     print(f"{'='*55}\n")
     app.run(debug=True, port=5000, threaded=True)
