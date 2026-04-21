@@ -18,14 +18,14 @@ Output:
     - PSDs : C:\\Varsany\\Output\\DTF_Excel\\<Category>\\<OrderID>_<SKU>.psd
 """
 
-import os, json, struct, io, traceback, argparse
+import os, json, struct, io, traceback, argparse, textwrap
 from datetime import datetime
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-EXCEL_FILE    = r"W:\test2\UnshippedDTFOrders_14042026_013121.xlsx"
-IMAGE_FOLDER  = r"W:\test2\DTFUnshippedImages_20260414_013102"
+EXCEL_FILE    = r"W:\test4\UnshippedDTFOrders_16042026_013539.xlsx"
+IMAGE_FOLDER  = r"W:\test4\DTFUnshippedImages_20260416_013516"
 OUTPUT_FOLDER = r"C:\Varsany\Output\DTF_Excel"
 FONT_FOLDERS  = [r"C:\Varsany\Fonts", r"W:\fonts"]
 LOG_FILE      = r"C:\Varsany\Output\DTF_Excel\dtf_excel_log.txt"
@@ -33,22 +33,49 @@ LOG_FILE      = r"C:\Varsany\Output\DTF_Excel\dtf_excel_log.txt"
 PX_PER_CM = 120          # 304 DPI for test — change to 320 for production
 DPI       = int(PX_PER_CM * 2.54)
 
+# ─── SKIP LIST ────────────────────────────────────────────────────────────────
+# Orders where designs are already ready — do not process
+SKIP_ORDER_IDS: set = set()   # cleared — covered by SKU prefix matching below
+# SKU prefixes to skip (design already available for entire product type)
+SKIP_SKU_PREFIXES = [
+    "FballN",             # football kids hoodies (FballN01, FballN02, FballN05...)
+    "NewFballN",          # new football kids hoodies
+    "FBall",              # football PE bags (FBall01PEBag...)
+    "FootballAdultTee_",  # football adult tees
+    "FootballKidsTee_",   # football kids tees
+    "Memorial_",          # memorial book orders
+    "Name01Bckpck",       # backpacks type 1
+    "Name02Bckpck",       # backpacks type 2
+    "Name03Bckpck",       # backpacks type 3
+]
+
 # ─── PRODUCT CANVAS SIZES ─────────────────────────────────────────────────────
 def cm(x): return int(round(x * PX_PER_CM))
 
 PRODUCT_CANVAS = {
-    "adulttshirt":  {"front": (cm(30), cm(30)), "back": (cm(30), cm(30)),  "pocket": (cm(9), cm(7))},
-    "kidstshirt":   {"front": (cm(23), cm(30)), "back": (cm(23), cm(30)),  "pocket": (cm(9), cm(7))},
-    "adulthoodie":  {"front": (cm(25), cm(25)), "back": (cm(25), cm(25)),  "pocket": (cm(9), cm(7))},
-    "kidshoodie":   {"front": (cm(23), cm(20)), "back": (cm(23), cm(20)),  "pocket": (cm(9), cm(7))},
-    "totebag":      {"front": (cm(28), cm(28)), "back": (cm(28), cm(58))},
-    "babyvest":     {"front": (cm(15), cm(17))},
-    "buckethat":    {"front": (cm(18), cm(5))},
-    "beanie":       {"front": (cm(9.5), cm(4.5))},
-    "pegbag":       {"front": (cm(23), cm(14))},
-    "cushion":      {"front": (cm(30), cm(30))},
-    "slipper":      {"front": (cm(6),  cm(6))},
-    "default":      {"front": (cm(30), cm(30)), "back": (cm(30), cm(30)), "pocket": (cm(9), cm(7))},
+    "adulttshirt":  {"front": (cm(30),   cm(30)),  "back": (cm(30),   cm(30)),  "pocket": (cm(9), cm(7))},
+    "kidstshirt":   {"front": (cm(23),   cm(30)),  "back": (cm(23),   cm(30)),  "pocket": (cm(9), cm(7))},
+    "adulthoodie":  {"front": (cm(25),   cm(25)),  "back": (cm(25),   cm(25)),  "pocket": (cm(9), cm(7))},
+    "kidshoodie":   {"front": (cm(23),   cm(20)),  "back": (cm(23),   cm(20)),  "pocket": (cm(9), cm(7))},
+    "totebag":      {"front": (cm(28),   cm(28)),  "back": (cm(28),   cm(58))},
+    "babyvest":     {"front": (cm(15),   cm(17))},
+    "buckethat":    {"front": (cm(18),   cm(5))},
+    "beanie":       {"front": (cm(9.5),  cm(4.5))},
+    "pegbag":       {"front": (cm(23),   cm(14))},  # PE bag / Make Up Bag / Shoe Bag Sports
+    "cushion":      {"front": (cm(30),   cm(30))},
+    "slipper":      {"front": (cm(6),    cm(6))},
+    "backpack":     {"front": (cm(18),   cm(12))},
+    "shoebag":      {"front": (cm(14),   cm(14))},
+    "knittingbag":  {"front": (cm(25),   cm(21))},
+    "hoddiblanket": {"front": (cm(17),   cm(5))},
+    "golfcase":     {"front": (cm(15.7), cm(6))},
+    "golftowel":    {"front": (cm(17),   cm(17))},
+    "seatbelt":     {"front": (cm(18),   cm(4))},
+    "memorial":     {"front": (cm(13.5), cm(8.5))},
+    "sleepsuit":    {"front": (cm(13),   cm(18))},
+    "socks":        {"front": (cm(6),    cm(12))},
+    "stringbag":    {"front": (cm(22),   cm(24))},
+    "default":      {"front": (cm(30),   cm(30)),  "back": (cm(30),   cm(30)),  "pocket": (cm(9), cm(7))},
 }
 
 SKU_MAP = [
@@ -65,13 +92,25 @@ SKU_MAP = [
     ("AnyTxtAdultHood_",     "adulthoodie"), ("AnytxtFleece_",       "adulthoodie"),
     ("FballN",               "kidshoodie"),  ("NewFball",            "kidshoodie"),
     ("Gymnastichoodie",      "kidshoodie"),  ("AnyTxtKidsHood_",     "kidshoodie"),
-    ("AnyTxtTote_",          "totebag"),     ("Knitting",            "totebag"),
-    ("AnyTxtBabyVest_",      "babyvest"),
+    ("AnyTxtTote_",          "totebag"),     ("EasterGirlTote_",     "totebag"),
+    ("Knitting",             "knittingbag"),
+    ("AnyTxtBabyVest_",      "babyvest"),    ("CustomTxt01BabyVest_","babyvest"),
     ("AnyTextHat_",          "buckethat"),
     ("AnytxtPatchBeanie_",   "beanie"),
-    ("AnyTxtPEBag_",         "pegbag"),
+    ("AnyTxtPEBag_",         "pegbag"),      ("AnyTxtShoeBagSpt_",   "pegbag"),
+    ("AnyTxtMakeUpBag_",     "pegbag"),
     ("CustomCushion",        "cushion"),
-    ("Memorial_",            "default"),
+    ("Memorial_",            "memorial"),
+    ("Name01Bckpck",         "backpack"),    ("Name02Bckpck",        "backpack"),
+    ("Name03Bckpck",         "backpack"),
+    ("AnyTxtShoeBag_",       "shoebag"),
+    ("AnyTxtHoddiBlanket_",  "hoddiblanket"),
+    ("AnyTxtGolfCase_",      "golfcase"),
+    ("AnyTxtGolfTowel_",     "golftowel"),
+    ("AnyTxtSeatBelt_",      "seatbelt"),
+    ("AnyTxtSleepSuit_",     "sleepsuit"),
+    ("AnyTxtSocksAnkl_",     "socks"),       ("AnyTxtSocksSole_",    "socks"),
+    ("AnyTxtStringBag_",     "stringbag"),
 ]
 
 def detect_product(sku):
@@ -85,13 +124,26 @@ def detect_category(sku):
     if "kidstee" in s or "footballkids" in s: return "Kids T-Shirt"
     if "polo" in s:                            return "Polo"
     if "hood" in s or "fleece" in s:           return "Hoodie"
-    if "tote" in s or "knit" in s:             return "Tote Bag"
+    if "knit" in s:                            return "Knitting Bag"
+    if "tote" in s or "eastergirl" in s:       return "Tote Bag"
     if "babyvest" in s or "vest" in s:         return "Baby Vest"
+    if "bckpck" in s:                          return "Back Pack"
+    if "shoebag" in s:                         return "Shoe Bag"
+    if "makeupbag" in s:                       return "Make Up Bag"
     if "pegbag" in s or "pebag" in s:          return "PE Bag"
+    if "hoddiblanket" in s:                    return "Hoddi Blanket"
+    if "golfcase" in s:                        return "Golf Case"
+    if "golftowel" in s:                       return "Golf Towel"
+    if "seatbelt" in s:                        return "Seat Belt"
     if "cushion" in s:                         return "Cushion"
     if "beanie" in s:                          return "Hat"
-    if "dogtee" in s:                          return "Dog Tee"
+    if "buckethat" in s:                       return "Bucket Hat"
     if "memorial" in s:                        return "Memorial"
+    if "sleepsuit" in s:                       return "Sleepsuit"
+    if "socks" in s:                           return "Socks"
+    if "stringbag" in s:                       return "String Bag"
+    if "slipper" in s:                         return "Slipper"
+    if "dogtee" in s:                          return "Dog Tee"
     return "T-Shirt"
 
 # ─── FONT INDEX ───────────────────────────────────────────────────────────────
@@ -227,21 +279,23 @@ def hex_to_rgb(hex_col):
 
 # Garment colour keywords in SKU → approximate RGB
 SKU_COLOUR_MAP = {
-    'wht': (255, 255, 255), 'blk': (0,   0,   0  ),
-    'nvy': (31,  40,  80 ), 'red': (200, 30,  30 ),
-    'ylw': (255, 220, 0  ), 'pnk': (255, 150, 180),
-    'gry': (150, 150, 150), 'grn': (30,  130, 30 ),
-    'org': (230, 100, 20 ), 'blu': (30,  80,  200),
-    'rblu':(50,  100, 220), 'sblu':(100, 150, 210),
-    'nat': (240, 230, 200), 'ivry':(240, 230, 200),
-    'bur': (130, 30,  50 ), 'fus': (200, 50,  140),
-    'ppl': (120, 50,  170),
+    'wht':  (255, 255, 255), 'blk':  (0,   0,   0  ),
+    'nvy':  (31,  40,  80 ), 'red':  (200, 30,  30 ),
+    'ylw':  (255, 220, 0  ), 'opnk': (255, 130, 100),
+    'pnk':  (255, 150, 180), 'gry':  (150, 150, 150),
+    'grn':  (30,  130, 30 ), 'org':  (230, 100, 20 ),
+    'rblu': (50,  100, 220), 'sblu': (100, 150, 210),
+    'blu':  (30,  80,  200), 'nat':  (240, 230, 200),
+    'ivry': (240, 230, 200), 'bur':  (130, 30,  50 ),
+    'fus':  (200, 50,  140), 'pur':  (120, 50,  170),
+    'ppl':  (120, 50,  170), 'teal': (0,   130, 130),
 }
 
 def _garment_colour(sku):
     """Return approximate garment RGB from SKU, or None if unknown."""
     s = sku.lower()
-    for key, rgb in SKU_COLOUR_MAP.items():
+    # Longest keys first so 'rblu'/'sblu'/'opnk' are matched before 'blu'/'pnk'
+    for key, rgb in sorted(SKU_COLOUR_MAP.items(), key=lambda x: -len(x[0])):
         if key in s:
             return rgb
     return None
@@ -274,44 +328,157 @@ def should_remove_bg(img_path, sku, row, zone):
     if not img_path or not os.path.isfile(img_path):
         return False
 
-    # 2. Auto-detect: solid uniform background on all edges → remove
+    # 2. Auto-detect: solid uniform background → remove only if bg matches garment
     try:
         import numpy as np
         img = Image.open(img_path).convert('RGB')
         arr = np.array(img)
-        edges = [
-            arr[0,  :,  :].mean(axis=0),   # top row
-            arr[-1, :,  :].mean(axis=0),   # bottom row
-            arr[:,  0,  :].mean(axis=0),   # left col
-            arr[:, -1,  :].mean(axis=0),   # right col
-        ]
-        # Check all 4 edges agree on the same colour
-        for i in range(1, 4):
-            if not _colour_close(tuple(edges[0].astype(int)),
-                                  tuple(edges[i].astype(int)), tol=25):
-                return False
-        # Edges are uniform — check it's not a gradient or content image
-        bg_colour = tuple(edges[0].astype(int))
+
+        # Collect every pixel on all 4 edges
+        all_edge_px = np.concatenate([
+            arr[0,  :, :],   # top row
+            arr[-1, :, :],   # bottom row
+            arr[:,  0, :],   # left col
+            arr[:, -1, :],   # right col
+        ], axis=0)
+
+        # Background colour = median of edge pixels (robust to corners/noise)
+        bg_r = int(np.median(all_edge_px[:, 0]))
+        bg_g = int(np.median(all_edge_px[:, 1]))
+        bg_b = int(np.median(all_edge_px[:, 2]))
+        bg_colour = (bg_r, bg_g, bg_b)
+
+        # What fraction of edge pixels are close to that background colour?
+        tol_px = 30
+        matches = np.sum(
+            (np.abs(all_edge_px[:, 0].astype(int) - bg_r) <= tol_px) &
+            (np.abs(all_edge_px[:, 1].astype(int) - bg_g) <= tol_px) &
+            (np.abs(all_edge_px[:, 2].astype(int) - bg_b) <= tol_px)
+        )
+        solid_fraction = matches / len(all_edge_px)
+
+        # Photos/natural images have varying edges → low fraction.
+        # Logos on solid bg have nearly uniform edges → high fraction.
+        # Require 85%+ edge pixels to be the same colour before removing.
+        if solid_fraction < 0.85:
+            return False
+
+        # Extra check: photos have thousands of unique colours; logos have few.
+        # Sample every 4th pixel for performance.
+        sample = arr[::4, ::4, :3].reshape(-1, 3)
+        unique_colours = len(np.unique(sample, axis=0))
+        if unique_colours > 5000:
+            return False   # Complex/photo image — keep background as-is
+
+        # Solid logo background confirmed — only remove if it matches garment colour
         garment_rgb = _garment_colour(sku)
-        # Remove if: (a) bg matches garment colour, OR (b) bg is any solid
-        # colour (black, white, grey etc.) that would appear as a rectangle
-        is_solid_neutral = all(abs(bg_colour[0] - bg_colour[c]) < 20
-                               for c in range(1, 3))   # r≈g≈b → grey/neutral
         if garment_rgb and _colour_close(bg_colour, garment_rgb, tol=40):
-            return True
-        if is_solid_neutral:
             return True
         return False
     except Exception:
         return False
 
 def remove_background(img_path):
-    """Run rembg on img_path, return PIL RGBA image with background removed."""
-    from rembg import remove as rembg_remove
+    """
+    Remove background from image.
+    Strategy:
+      1. rembg (isnet-general-use model) for subject isolation
+      2. Post-process: flood-fill from edges to remove remaining
+         background-coloured pixels rembg missed
+      3. Hard alpha threshold — no soft semi-transparent fringing
+    """
+    import numpy as np
+    from rembg import remove as rembg_remove, new_session
+
     with open(img_path, 'rb') as f:
-        data = f.read()
-    result = rembg_remove(data)
-    return Image.open(io.BytesIO(result)).convert('RGBA')
+        raw = f.read()
+
+    # Detect background colour from image corners before removal
+    orig = ImageOps.exif_transpose(Image.open(img_path)).convert('RGB')
+    ow, oh = orig.size
+    sample_pts = [(2, 2), (ow-3, 2), (2, oh-3), (ow-3, oh-3)]
+    bg_samples = [orig.getpixel(p) for p in sample_pts]
+    bg_r = int(sum(c[0] for c in bg_samples) / 4)
+    bg_g = int(sum(c[1] for c in bg_samples) / 4)
+    bg_b = int(sum(c[2] for c in bg_samples) / 4)
+
+    # Step 1: rembg with isnet model (better edge quality than default)
+    try:
+        session = new_session("birefnet-general")
+        result  = rembg_remove(raw, session=session)
+    except Exception:
+        result = rembg_remove(raw)   # fallback to default
+
+    img = Image.open(io.BytesIO(result)).convert('RGBA')
+    arr = np.array(img, dtype=np.uint8)
+
+    # Step 2: flood-fill from all 4 edges to catch remaining bg pixels
+    from collections import deque
+    h, w = arr.shape[:2]
+    tol  = 35   # colour tolerance for bg matching
+    visited = np.zeros((h, w), dtype=bool)
+    queue   = deque()
+
+    # Seed with all edge pixels that are close to bg colour
+    for x in range(w):
+        for y in [0, h-1]:
+            r, g, b, a = arr[y, x]
+            if (abs(int(r)-bg_r) <= tol and abs(int(g)-bg_g) <= tol
+                    and abs(int(b)-bg_b) <= tol):
+                queue.append((y, x))
+                visited[y, x] = True
+    for y in range(h):
+        for x in [0, w-1]:
+            r, g, b, a = arr[y, x]
+            if (abs(int(r)-bg_r) <= tol and abs(int(g)-bg_g) <= tol
+                    and abs(int(b)-bg_b) <= tol and not visited[y, x]):
+                queue.append((y, x))
+                visited[y, x] = True
+
+    while queue:
+        cy, cx = queue.popleft()
+        arr[cy, cx, 3] = 0   # make transparent
+        for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]:
+            ny, nx = cy+dy, cx+dx
+            if 0 <= ny < h and 0 <= nx < w and not visited[ny, nx]:
+                r, g, b, a = arr[ny, nx]
+                if (abs(int(r)-bg_r) <= tol and abs(int(g)-bg_g) <= tol
+                        and abs(int(b)-bg_b) <= tol):
+                    visited[ny, nx] = True
+                    queue.append((ny, nx))
+
+    # Step 3: remove any remaining pixels that match background colour
+    # (handles enclosed bg "islands" inside the logo not reached by flood fill)
+    r_ch = arr[:, :, 0].astype(int)
+    g_ch = arr[:, :, 1].astype(int)
+    b_ch = arr[:, :, 2].astype(int)
+    inner_bg = (
+        (np.abs(r_ch - bg_r) <= tol) &
+        (np.abs(g_ch - bg_g) <= tol) &
+        (np.abs(b_ch - bg_b) <= tol) &
+        (arr[:, :, 3] > 0)
+    )
+    arr[inner_bg, 3] = 0
+
+    # Step 4: aggressive near-background cleanup — rembg sometimes leaves
+    # bg-coloured pixels with high alpha (200-250). Catch them with a tighter
+    # colour match but wider alpha range.
+    r_ch = arr[:, :, 0].astype(int)
+    g_ch = arr[:, :, 1].astype(int)
+    b_ch = arr[:, :, 2].astype(int)
+    tight_bg = (
+        (np.abs(r_ch - bg_r) <= 60) &
+        (np.abs(g_ch - bg_g) <= 60) &
+        (np.abs(b_ch - bg_b) <= 60) &
+        (arr[:, :, 3] > 0)
+    )
+    arr[tight_bg, 3] = 0
+
+    # Step 5: hard alpha threshold — remove soft fringing
+    alpha = arr[:, :, 3]
+    arr[:, :, 3] = np.where(alpha < 128, 0, 255).astype(np.uint8)
+
+    return Image.fromarray(arr, 'RGBA')
 
 # ─── IMAGE LOOKUP ─────────────────────────────────────────────────────────────
 
@@ -349,7 +516,27 @@ def find_images_for_item(order_item_id):
 # ─── PSD WRITER ───────────────────────────────────────────────────────────────
 
 def _to_channels(img, mode):
-    """Split image into raw channel bytes (no compression — matches PSD compression type 0)."""
+    """Split image into raw channel bytes (no compression — matches PSD compression type 0).
+
+    PSD CMYK stores ink coverage inverted: 0 = full ink, 255 = no ink.
+    PIL CMYK is the opposite, so we invert all CMYK channels before writing.
+    """
+    import numpy as np
+
+    def _inv(band):
+        """Invert a PIL band for PSD CMYK encoding."""
+        return bytes(np.clip(255 - np.frombuffer(band.tobytes(), dtype=np.uint8), 0, 255).astype(np.uint8))
+
+    if mode == 'CMYKA':
+        rgba = img.convert('RGBA')
+        a    = rgba.split()[3]
+        cmyk = rgba.convert('RGB').convert('CMYK')
+        c, m, y, k = cmyk.split()
+        return {-1: a.tobytes(), 0: _inv(c), 1: _inv(m), 2: _inv(y), 3: _inv(k)}
+    if mode == 'CMYK':
+        cmyk = img.convert('RGB').convert('CMYK')
+        c, m, y, k = cmyk.split()
+        return {0: _inv(c), 1: _inv(m), 2: _inv(y), 3: _inv(k)}
     img = img.convert(mode)
     bands = img.split()
     if mode == 'RGBA':
@@ -364,16 +551,32 @@ def _pack_layer_name(name):
     return struct.pack('>B', len(n)) + n + b'\x00' * pad
 
 def write_psd(out_path, canvas_w, canvas_h, layers):
-    """Write a layered RGB PSD file. Layers: list of dicts with image/top/left/name/opacity/visible."""
+    """
+    Write a layered RGB PSD (or PSB for large files) file.
+    Auto-switches to PSB when estimated size exceeds 1.5 GB.
+    Layers: list of dicts with image/top/left/name/opacity/visible.
+    """
+    # Estimate uncompressed size: canvas pixels × 4 bytes × layers
+    est_bytes = canvas_w * canvas_h * 4 * (len(layers) + 1)
+    psb = est_bytes > 1.5 * 1024**3   # use PSB if >1.5 GB estimated
+
+    if psb and out_path.endswith('.psd'):
+        out_path = out_path[:-4] + '.psb'
+
+    # PSB uses 8-byte length fields; PSD uses 4-byte
+    ch_len_fmt   = '>hQ' if psb else '>hI'   # channel data length in layer record
+    sec_len_fmt  = '>Q'  if psb else '>I'    # layer info / lmi section lengths
+    version      = 2     if psb else 1
+
     buf = io.BytesIO()
     p   = buf.write
 
     p(b'8BPS')
-    p(struct.pack('>H', 1))       # version 1 = PSD
+    p(struct.pack('>H', version))
     p(b'\x00' * 6)
-    p(struct.pack('>H', 3))       # 3 channels (RGB)
+    p(struct.pack('>H', 4))       # 4 channels (CMYK)
     p(struct.pack('>II', canvas_h, canvas_w))
-    p(struct.pack('>HH', 8, 3))   # 8 bpc, RGB
+    p(struct.pack('>HH', 8, 4))   # 8 bpc, CMYK
 
     # Image resources: DPI
     p(struct.pack('>I', 0))
@@ -394,14 +597,14 @@ def write_psd(out_path, canvas_w, canvas_h, layers):
         right  = left + img.width
         flags  = 0 if lyr.get('visible', True) else 2
 
-        ch = _to_channels(img, 'RGBA')
-        ch_order = [-1, 0, 1, 2]
+        ch = _to_channels(img, 'CMYKA')
+        ch_order = [-1, 0, 1, 2, 3]   # alpha, C, M, Y, K
 
         lr = io.BytesIO()
         lr.write(struct.pack('>iiii', top, left, bottom, right))
-        lr.write(struct.pack('>H', 4))
+        lr.write(struct.pack('>H', 5))   # 5 channels: alpha + CMYK
         for cid in ch_order:
-            lr.write(struct.pack('>hI', cid, len(ch[cid]) + 2))
+            lr.write(struct.pack(ch_len_fmt, cid, len(ch[cid]) + 2))
         lr.write(b'8BIM')
         lr.write(b'norm')
         lr.write(struct.pack('>BB', lyr.get('opacity', 255), 0))
@@ -413,60 +616,120 @@ def write_psd(out_path, canvas_w, canvas_h, layers):
         lr_buf.write(lr.getvalue())
 
         for cid in ch_order:
-            ld_buf.write(struct.pack('>H', 0))   # compression = deflate raw
+            ld_buf.write(struct.pack('>H', 0))   # compression = raw
             ld_buf.write(ch[cid])
 
     layer_info = struct.pack('>h', len(layers)) + lr_buf.getvalue() + ld_buf.getvalue()
     if len(layer_info) % 4:
         layer_info += b'\x00' * (4 - len(layer_info) % 4)
-    lmi = struct.pack('>I', len(layer_info)) + layer_info + struct.pack('>I', 0)
-    p(struct.pack('>I', len(lmi)))
+    lmi = struct.pack(sec_len_fmt, len(layer_info)) + layer_info + struct.pack('>I', 0)
+    p(struct.pack(sec_len_fmt, len(lmi)))
     p(lmi)
 
-    # Composite (merged) image
+    # Composite (merged) image — CMYK
     composite = Image.new('RGB', (canvas_w, canvas_h), (255, 255, 255))
     for lyr in layers:
         if lyr.get('visible', True):
             composite.paste(lyr['image'].convert('RGBA'),
                             (lyr['left'], lyr['top']),
                             lyr['image'].convert('RGBA'))
-    comp = _to_channels(composite, 'RGB')
+    comp = _to_channels(composite, 'CMYK')
     p(struct.pack('>H', 0))
-    for cid in [0, 1, 2]:
+    for cid in [0, 1, 2, 3]:
         p(comp[cid])
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, 'wb') as f:
         f.write(buf.getvalue())
+    return out_path   # may have changed extension to .psb
 
 # ─── LAYER BUILDERS ───────────────────────────────────────────────────────────
 
 def build_image_layer(img_path, w, h, do_bg_remove=False):
-    """Scale image to fill zone width, top-aligned. Optionally removes background."""
+    """Scale image to fit within zone (aspect-ratio preserved). Optionally removes background."""
     if not img_path or not os.path.isfile(img_path):
         return Image.new('RGBA', (max(1, w), max(1, h)), (0, 0, 0, 0)), 0, 0
     if do_bg_remove:
         try:
             src = remove_background(img_path)
             log(f'    BG removed: {os.path.basename(img_path)}')
+            # Trim transparent border so the subject fills the canvas after scaling
+            bbox = src.getbbox()
+            if bbox:
+                src = src.crop(bbox)
+                log(f'    Trimmed to content: {src.width}x{src.height}')
         except Exception as e:
             log(f'    BG removal failed ({e}), using original', 'WARN')
             src = Image.open(img_path).convert('RGBA')
     else:
-        src = Image.open(img_path).convert('RGBA')
-    ratio = w / src.width
-    nw    = w
-    nh    = max(1, int(src.height * ratio))
-    src   = src.resize((nw, nh), Image.LANCZOS)
-    return src, 0, 0
+        src = ImageOps.exif_transpose(Image.open(img_path)).convert('RGBA')
+    # Scale to fit within canvas dimensions — whichever side is the limiting factor.
+    # If width already matches, don't stretch height beyond canvas; vice-versa.
+    ratio_w = w / src.width
+    ratio_h = h / src.height
+    ratio   = min(ratio_w, ratio_h)
+    nw      = max(1, int(src.width  * ratio))
+    nh      = max(1, int(src.height * ratio))
+    src     = src.resize((nw, nh), Image.LANCZOS)
+    # Sharpen after upscaling — LANCZOS softens slightly, unsharp mask restores crispness
+    alpha = src.split()[3] if src.mode == 'RGBA' else None
+    rgb   = src.convert('RGB').filter(ImageFilter.UnsharpMask(radius=2, percent=200, threshold=2))
+    if alpha is not None:
+        r, g, b = rgb.split()
+        src = Image.merge('RGBA', (r, g, b, alpha))
+    else:
+        src = rgb.convert('RGBA')
+    # Centre horizontally within zone if image is narrower than zone width
+    left_offset = (w - nw) // 2
+    return src, 0, left_offset
+
+def _distribute_words(words, n):
+    """Split words into n lines with roughly equal total character length."""
+    if n >= len(words):
+        return words
+    total = sum(len(w) for w in words)
+    target = total / n
+    lines, current, current_len = [], [], 0
+    for i, word in enumerate(words):
+        current.append(word)
+        current_len += len(word)
+        if current_len >= target and len(lines) < n - 1:
+            lines.append(' '.join(current))
+            current, current_len = [], 0
+    if current:
+        lines.append(' '.join(current))
+    return lines
+
+
+def auto_wrap_lines(lines, font_name, w, h):
+    """If a single long line exists, try word-wrapping it to maximise font size."""
+    stripped = [l for l in lines if l.strip()]
+    if len(stripped) != 1:
+        return stripped
+    line = stripped[0]
+    if len(line) <= 20 or ' ' not in line:
+        return stripped
+    words = line.split()
+    if len(words) < 3:
+        return stripped
+    best_lines = stripped
+    best_size  = find_best_font_size(stripped, font_name, w, h)
+    for n in range(2, min(len(words), 6)):
+        candidate = _distribute_words(words, n)
+        if len(candidate) > 1:
+            sz = find_best_font_size(candidate, font_name, w, h)
+            if sz > best_size:
+                best_size, best_lines = sz, candidate
+    return best_lines
+
 
 def build_text_layer(text_lines, font_name, colour_hex, w, h, force_size=None):
     """Auto-size text to fill zone width, centre each line."""
     lines = [l for l in text_lines if l.strip()]
     if not lines:
         return Image.new('RGBA', (1, 1), (0, 0, 0, 0)), 0, 0
-
-    best = find_best_font_size(text_lines, font_name, w, h, force_size)
+    lines = auto_wrap_lines(lines, font_name, w, h)
+    best = find_best_font_size(lines, font_name, w, h, force_size)
     return _render_text(lines, font_name, colour_hex, w, best)
 
 
@@ -483,14 +746,22 @@ def find_best_font_size(text_lines, font_name, w, h, force_size=None):
     draw    = ImageDraw.Draw(scratch)
     lo, hi  = 20, max(w, h)
     best    = lo
+    has_emoji = any(_line_has_emoji(l) for l in lines)
     while lo <= hi:
         mid  = (lo + hi) // 2
         font = get_font(font_name, mid)
-        widths = [draw.textbbox((0, 0), l, font=font)[2] - draw.textbbox((0, 0), l, font=font)[0]
-                  for l in lines]
-        bb0    = draw.textbbox((0, 0), lines[0], font=font)
-        line_h = int((bb0[3] - bb0[1]) * 1.4)
-        total_h = line_h * len(lines)
+        if has_emoji:
+            sizes  = [_pilmoji_measure(l, font) for l in lines]
+            widths = [s[0] for s in sizes]
+            line_h = int(max(s[1] for s in sizes) * 1.4) if sizes else 20
+            total_h = line_h * len(lines)
+        else:
+            # Use multiline_textbbox so height measurement matches _render_text exactly
+            text   = "\n".join(lines)
+            widths = [draw.textbbox((0, 0), l, font=font)[2] - draw.textbbox((0, 0), l, font=font)[0]
+                      for l in lines]
+            mb     = draw.multiline_textbbox((0, 0), text, font=font, spacing=0, align='center')
+            total_h = mb[3] - mb[1]
         if max(widths) <= avail_w and total_h <= avail_h:
             best, lo, hi = mid, mid + 1, hi
         else:
@@ -498,39 +769,127 @@ def find_best_font_size(text_lines, font_name, w, h, force_size=None):
     return best
 
 
-def _render_text(lines, font_name, colour_hex, w, font_size):
-    """Render text lines at a specific font size, center-aligned, returns (img, top=0, left).
+# ─── EMOJI RENDERING (pilmoji / Twemoji) ──────────────────────────────────────
 
-    Each line is centered relative to the widest line. The image is sized
-    to the widest line (+ small margin) and then centered in the zone width w.
-    This guarantees every line stays centered regardless of text length.
+def _is_emoji_char(c):
+    """Return True if the character is likely an emoji or special Unicode symbol
+    that may not be present in standard Latin fonts."""
+    cp = ord(c)
+    return (
+        0x00A9 <= cp <= 0x00AE or       # © ®
+        0x2000 <= cp <= 0x27FF or       # Misc symbols, arrows, dingbats
+        0x2900 <= cp <= 0x2BFF or       # More arrows, misc symbols
+        0x1F300 <= cp <= 0x1FAFF or     # All modern emoji blocks (faces, objects, flags …)
+        0xFE00 <= cp <= 0xFE0F or       # Variation selectors (emoji vs text presentation)
+        cp == 0x200D                    # ZWJ
+    )
+
+
+def _line_has_emoji(line):
+    return any(_is_emoji_char(c) for c in line)
+
+
+def _emoji_source():
+    try:
+        from pilmoji.source import GoogleEmojiSource
+        return GoogleEmojiSource
+    except Exception:
+        return None
+
+
+def _pilmoji_measure(line, font):
+    """Return (width, height) for a line that may contain emoji, using pilmoji."""
+    try:
+        from pilmoji import Pilmoji
+        src = _emoji_source()
+        tmp = Image.new('RGBA', (1, 1))
+        kwargs = {'source': src} if src else {}
+        with Pilmoji(tmp, **kwargs) as p:
+            return p.getsize(line, font=font)
+    except Exception:
+        tmp = Image.new('RGBA', (1, 1))
+        bb = ImageDraw.Draw(tmp).textbbox((0, 0), line, font=font)
+        return bb[2] - bb[0], bb[3] - bb[1]
+
+
+def _pilmoji_draw(img, x, y, line, font, fill):
+    """Draw a text line with emoji onto img using pilmoji + Google Noto emoji."""
+    try:
+        from pilmoji import Pilmoji
+        src = _emoji_source()
+        kwargs = {'source': src} if src else {}
+        with Pilmoji(img, **kwargs) as p:
+            p.text((x, y), line, font=font, fill=fill)
+    except Exception:
+        ImageDraw.Draw(img).text((x, y), line, font=font, fill=fill)
+
+
+def _render_line_to_strip(line, font, colour, use_emoji, pad=200):
+    """Render a single text line to its own RGBA image cropped to actual pixel bounds.
+
+    Uses a generous padding so that font bearing / overhang is never clipped.
+    Returns a PIL Image (RGBA) containing only the inked pixels.
     """
-    r, g, b = hex_to_rgb(colour_hex)
-    font    = get_font(font_name, font_size)
-    scratch = Image.new('RGBA', (1, 1))
-    draw    = ImageDraw.Draw(scratch)
+    r, g, b = colour
+    scratch  = Image.new('RGBA', (1, 1))
+    bb       = ImageDraw.Draw(scratch).textbbox((0, 0), line or 'Ag', font=font)
+    est_w    = max(bb[2] - bb[0], 10) + pad * 2
+    est_h    = max(bb[3] - bb[1], 10) + pad * 2
+    strip    = Image.new('RGBA', (max(1, est_w), max(1, est_h)), (0, 0, 0, 0))
+    if use_emoji:
+        _pilmoji_draw(strip, pad, pad, line, font, (r, g, b, 255))
+    else:
+        ImageDraw.Draw(strip).text((pad, pad), line, font=font, fill=(r, g, b, 255))
+    bbox = strip.getbbox()
+    if bbox:
+        return strip.crop(bbox)
+    # blank line — return a transparent sliver with the right height
+    return Image.new('RGBA', (1, max(bb[3] - bb[1], 10)), (0, 0, 0, 0))
 
-    # Measure all lines
-    line_bbs = [draw.textbbox((0, 0), l, font=font) for l in lines]
-    line_ws  = [bb[2] - bb[0] for bb in line_bbs]
-    line_hs  = [bb[3] - bb[1] for bb in line_bbs]
-    line_h   = int(max(line_hs) * 1.4)        # uniform line height
-    max_lw   = max(line_ws) if line_ws else 1
-    margin   = max(10, line_h // 6)
 
-    # Image exactly fits the text block (no excess padding)
-    img_w = max_lw + 2 * margin
-    img_h = line_h * len(lines) + 2 * margin
-    img   = Image.new('RGBA', (max(1, img_w), max(1, img_h)), (0, 0, 0, 0))
-    d     = ImageDraw.Draw(img)
-    yl    = margin
-    for lw, line in zip(line_ws, lines):
-        x = margin + (max_lw - lw) // 2   # center line within max_lw
-        d.text((x, yl), line, font=font, fill=(r, g, b, 255))
-        yl += line_h
+def _render_text(lines, font_name, colour_hex, w, font_size):
+    """Render text lines at a specific font size, center-aligned, returns (img, top=0, left)."""
+    r, g, b   = hex_to_rgb(colour_hex)
+    font      = get_font(font_name, font_size)
+    use_emoji = any(_line_has_emoji(l) for l in lines)
 
-    # Center the image in the zone width
-    left = (w - img_w) // 2   # may be negative only if font overflows (prevented by binary search)
+    if use_emoji:
+        # Emoji: render each line to its own strip, crop to actual pixels, center-paste.
+        # pilmoji doesn't support multiline align so we do it manually.
+        line_imgs = [_render_line_to_strip(l, font, (r, g, b), use_emoji) for l in lines]
+        line_ws   = [img.width  for img in line_imgs]
+        line_hs   = [img.height for img in line_imgs]
+        max_lw    = max(line_ws) if line_ws else 1
+        line_h    = int(max(line_hs) * 1.4)
+        margin    = max(10, line_h // 6)
+        img_w     = max_lw + 2 * margin
+        img_h     = line_h * len(lines) + 2 * margin
+        img       = Image.new('RGBA', (max(1, img_w), max(1, img_h)), (0, 0, 0, 0))
+        yl        = margin
+        for limg, lw in zip(line_imgs, line_ws):
+            img.paste(limg, (margin + (max_lw - lw) // 2, yl), limg)
+            yl += line_h
+    else:
+        # Non-emoji: use PIL's built-in multiline_text with align='center'.
+        # This is the most reliable way to center lines relative to each other.
+        text      = "\n".join(lines)
+        scratch   = Image.new('RGBA', (1, 1))
+        d_s       = ImageDraw.Draw(scratch)
+        spacing   = 0   # PIL's natural line height; matches find_best_font_size
+        ref_h     = d_s.textbbox((0, 0), lines[0] or 'Ag', font=font)
+        margin    = max(10, (ref_h[3] - ref_h[1]) // 6)
+        bb        = d_s.multiline_textbbox((0, 0), text, font=font,
+                                           spacing=spacing, align='center')
+        img_w     = int(bb[2] - bb[0]) + margin * 2
+        img_h     = int(bb[3] - bb[1]) + margin * 2
+        img       = Image.new('RGBA', (max(1, img_w), max(1, img_h)), (0, 0, 0, 0))
+        ImageDraw.Draw(img).multiline_text(
+            (-bb[0] + margin, -bb[1] + margin),
+            text, font=font, fill=(r, g, b, 255),
+            spacing=0, align='center'
+        )
+
+    left = (w - img_w) // 2
     return img, 0, left
 
 def build_label_layer(text):
@@ -593,12 +952,11 @@ def active_zones_for_row(row, images):
     if 'sleeve' in loc:
         from_loc.add('sleeve')
 
-    # Build data-presence set (image file or non-empty text)
+    # Build data-presence set (actual customer image or text only — NOT preview)
+    # Preview images are reference-only and must not trigger zone creation.
     from_data: set[str] = set()
     for zone in ZONES:
-        if (zone in images
-                or f'{zone}preview' in images
-                or bool(parse_text_lines(row, zone))):
+        if zone in images or bool(parse_text_lines(row, zone)):
             from_data.add(zone)
 
     # Union: include a zone if signalled by either source
@@ -716,6 +1074,16 @@ def process_excel_orders(limit=None, dry_run=False, order_id=None):
         first    = rows[0]
         sku_raw  = _safe(first.get('SKU')) or 'UNKNOWN'
         safe_id  = order_id.replace('/', '-')
+
+        # Skip orders with pre-made designs
+        if order_id in SKIP_ORDER_IDS:
+            log(f'[{i}/{total_orders}] SKIP (pre-made design): {order_id}')
+            skip_count += 1
+            continue
+        if any(sku_raw.startswith(p) for p in SKIP_SKU_PREFIXES):
+            log(f'[{i}/{total_orders}] SKIP (pre-made SKU: {sku_raw}): {order_id}')
+            skip_count += 1
+            continue
         safe_sku = sku_raw.replace('/', '-').replace('\\', '-')
         skus_str = ' | '.join(_safe(r.get('SKU')) or '?' for r in rows)
 
@@ -770,6 +1138,7 @@ def process_excel_orders(limit=None, dry_run=False, order_id=None):
 
                 zones_for_row.append({
                     'label':        label_txt,
+                    'zone_key':     zone_key,
                     'zw': zw, 'zh': zh,
                     'img_path':     img_path,
                     'prev_path':    prev_path,
@@ -781,7 +1150,10 @@ def process_excel_orders(limit=None, dry_run=False, order_id=None):
 
             if not zones_for_row:
                 log(f'  WARNING: no active zones for item {item_id}', 'WARN')
-            row_data.append(zones_for_row)
+            # Stack copies for Quantity > 1
+            qty = int(row.get('Quantity', 1) or 1)
+            for _ in range(qty):
+                row_data.append(zones_for_row)
 
         flat_zones = [z for zones in row_data for z in zones]
         if not flat_zones:
@@ -789,22 +1161,28 @@ def process_excel_orders(limit=None, dry_run=False, order_id=None):
             skip_count += 1
             continue
 
-        # ── For multi-item orders: unify font size across all text zones ────────
-        # Compute best font size per zone first, then apply the minimum so all
-        # items look consistent (e.g. "Big Bro" / "Little Bro" same size).
+        # ── For multi-item orders: unify font size PER ZONE TYPE ────────────────
+        # Compute best font size per zone first, then apply the minimum within
+        # each zone type so items look consistent (e.g. "Big Bro" / "Little Bro"
+        # same size on front, and same size on back — but front and back are
+        # sized independently, since back often has more lines and would
+        # otherwise shrink the front text unnecessarily).
         LABEL_H = build_label_layer('Front').height + cm(0.3)
         multi_item = len(rows) > 1
         if multi_item:
-            txt_font_sizes = []
+            sizes_by_zone_key = {}   # (zone_key, zw, zh) -> [font_sizes]
             for zones in row_data:
                 for zone in zones:
                     if zone['txt_lines']:
-                        sz = find_best_font_size(zone['txt_lines'], zone['font_name'],
+                        wrapped = auto_wrap_lines(zone['txt_lines'], zone['font_name'],
+                                                  zone['zw'], zone['zh'])
+                        sz = find_best_font_size(wrapped, zone['font_name'],
                                                  zone['zw'], zone['zh'])
-                        txt_font_sizes.append(sz)
-            unified_font_size = min(txt_font_sizes) if txt_font_sizes else None
+                        key = (zone['zone_key'], zone['zw'], zone['zh'])
+                        sizes_by_zone_key.setdefault(key, []).append(sz)
+            unified_font_sizes = {k: min(szs) for k, szs in sizes_by_zone_key.items()}
         else:
-            unified_font_size = None
+            unified_font_sizes = {}
 
         # ── Render layers first so we know actual content heights ────────────
         rendered_rows = []
@@ -823,7 +1201,7 @@ def process_excel_orders(limit=None, dry_run=False, order_id=None):
                 if zone['txt_lines']:
                     txt_pil, tt, tl = build_text_layer(
                         zone['txt_lines'], zone['font_name'], zone['colour'], zw, zh,
-                        force_size=unified_font_size)
+                        force_size=unified_font_sizes.get((zone['zone_key'], zone['zw'], zone['zh'])))
                     zone_layers.append((f"{zone['label']} CustomerText", txt_pil, tt, tl, True))
                     content_h = max(content_h, tt + txt_pil.height)
 
@@ -896,7 +1274,7 @@ def process_excel_orders(limit=None, dry_run=False, order_id=None):
             continue
 
         try:
-            write_psd(out_path, canvas_w, canvas_h, all_layers)
+            out_path = write_psd(out_path, canvas_w, canvas_h, all_layers)
             size_mb = os.path.getsize(out_path) / 1024 / 1024
             log(f'  OK  {size_mb:.1f} MB  -> {out_path}', 'OK')
             ok_count += 1
