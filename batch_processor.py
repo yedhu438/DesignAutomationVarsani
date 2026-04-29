@@ -22,6 +22,12 @@ from PIL import Image, ImageDraw, ImageFont
 import pyodbc
 
 try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+except ImportError:
+    pass  # python-dotenv not installed — fall back to hardcoded defaults
+
+try:
     from rembg import remove as rembg_remove
     REMBG_AVAILABLE = True
 except ImportError:
@@ -36,27 +42,33 @@ except ImportError:
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-DB_CONNECTION = (
-    "DRIVER={ODBC Driver 17 for SQL Server};"
-    "SERVER=localhost\\SQLEXPRESS;"
-    "DATABASE=dbAmazonCustomOrders;"
-    "Trusted_Connection=yes;"
-    "TrustServerCertificate=yes;"
-)
+_db_server = os.environ.get("DB_SERVER", r"localhost\SQLEXPRESS")
+_db_name   = os.environ.get("DB_NAME",   "dbAmazonCustomOrders")
+_db_uid    = os.environ.get("DB_UID",    "")
+_db_pwd    = os.environ.get("DB_PWD",    "")
+if _db_uid and _db_pwd:
+    DB_CONNECTION = (
+        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+        f"SERVER={_db_server};DATABASE={_db_name};"
+        f"UID={_db_uid};PWD={_db_pwd};"
+        "TrustServerCertificate=yes;"
+    )
+else:
+    DB_CONNECTION = (
+        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+        f"SERVER={_db_server};DATABASE={_db_name};"
+        "Trusted_Connection=yes;TrustServerCertificate=yes;"
+    )
 
-IMAGE_FOLDERS = [
-    r"W:\images\Feb-Image",
-    r"W:\images\Jan-Image",
-    r"C:\Varsany\Uploads",
-]
-
-FONT_FOLDERS = [
-    r"C:\Varsany\Fonts",
-    r"W:\fonts",
-]
-
-OUTPUT_FOLDER = r"C:\Varsany\Output"
-LOG_FILE      = r"C:\Varsany\batch_log.txt"
+# Paths — override any of these in your .env file
+_base        = os.environ.get("VARSANY_BASE",    r"C:\Varsany")
+_images_extra = os.environ.get("VARSANY_IMAGES", r"W:\images\Feb-Image,W:\images\Jan-Image")
+IMAGE_FOLDERS = [p.strip() for p in _images_extra.split(",") if p.strip()] + \
+                [os.path.join(_base, "Uploads")]
+FONT_FOLDERS  = [os.path.join(_base, "Fonts")] + \
+                [p.strip() for p in os.environ.get("VARSANY_FONTS_EXTRA", r"W:\fonts").split(",") if p.strip()]
+OUTPUT_FOLDER = os.environ.get("VARSANY_OUTPUT", os.path.join(_base, "Output"))
+LOG_FILE      = os.environ.get("VARSANY_LOG",    os.path.join(_base, "batch_log.txt"))
 
 PX_PER_CM = 120
 DPI        = int(PX_PER_CM * 2.54)
@@ -802,9 +814,6 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
         import base64 as _b64
 
         try:
-            import sys as _sys
-            _sys.path.insert(
-                0, r"C:\Users\yedhu\AppData\Local\Programs\Python\Python313\Lib\site-packages")
             from fontTools.ttLib import TTFont
         except ImportError:
             return None
@@ -936,7 +945,7 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
             pass
 
         cmd = [
-            CHROME_EXE, "--headless=old", "--no-sandbox",
+            CHROME_EXE, "--headless", "--no-sandbox",
             "--disable-gpu", "--disable-extensions",
             "--no-first-run", "--disable-sync",
             f"--screenshot={png_path}",
@@ -1055,8 +1064,11 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
             for l in text_lines
         )
 
-        font_url = "file:///" + font_path.replace("\\", "/")
+        import base64 as _b64
+        with open(font_path, "rb") as _fh:
+            _font_b64 = _b64.b64encode(_fh.read()).decode("ascii")
         fmt      = "opentype" if font_path.lower().endswith(".otf") else "truetype"
+        font_url = f"data:font/{fmt};base64,{_font_b64}"
 
         html_src = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>
@@ -1082,9 +1094,8 @@ html,body{{background:{bg};width:{canvas_w}px}}
             pass
 
         cmd = [
-            CHROME_EXE, "--headless=old", "--no-sandbox",
+            CHROME_EXE, "--headless", "--no-sandbox",
             "--disable-gpu", "--disable-extensions",
-            "--allow-file-access-from-files",
             "--no-first-run", "--disable-sync",
             f"--screenshot={png_path}",
             f"--window-size={canvas_w},{max(200, total_h)}",
@@ -1131,9 +1142,6 @@ html,body{{background:{bg};width:{canvas_w}px}}
 
     # ── STRATEGY B: glyph-by-glyph SVG render ──────────────────────────────────
     try:
-        import sys as _sys
-        _sys.path.insert(
-            0, r"C:\Users\yedhu\AppData\Local\Programs\Python\Python313\Lib\site-packages")
         from fontTools.ttLib import TTFont
     except ImportError:
         log("fontTools not available — cannot render premium font", "WARN")
@@ -1222,7 +1230,7 @@ html,body{{background:{bg};width:{canvas_w}px}}
             f.write(svg)
 
         cmd = [
-            CHROME_EXE, "--headless=old", "--no-sandbox",
+            CHROME_EXE, "--headless", "--no-sandbox",
             "--disable-gpu", "--disable-extensions",
             "--no-first-run", "--disable-sync",
             f"--user-data-dir={profile_dir}",
