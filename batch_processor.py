@@ -61,14 +61,15 @@ else:
     )
 
 # Paths — override any of these in your .env file
-_base        = os.environ.get("VARSANY_BASE",    r"C:\Varsany")
-_images_extra = os.environ.get("VARSANY_IMAGES", r"W:\images\Feb-Image,W:\images\Jan-Image")
+_base         = os.environ.get("VARSANY_BASE",    r"C:\Varsany")
+_images_extra = os.environ.get("VARSANY_IMAGES",  r"W:\images\Feb-Image,W:\images\Jan-Image")
 IMAGE_FOLDERS = [p.strip() for p in _images_extra.split(",") if p.strip()] + \
                 [os.path.join(_base, "Uploads")]
 FONT_FOLDERS  = [os.path.join(_base, "Fonts")] + \
                 [p.strip() for p in os.environ.get("VARSANY_FONTS_EXTRA", r"W:\fonts").split(",") if p.strip()]
 OUTPUT_FOLDER = os.environ.get("VARSANY_OUTPUT", os.path.join(_base, "Output"))
 LOG_FILE      = os.environ.get("VARSANY_LOG",    os.path.join(_base, "batch_log.txt"))
+TEMP_FOLDER   = os.environ.get("VARSANY_TEMP",   os.path.join(_base, "Temp"))
 
 PX_PER_CM = 120
 DPI        = int(PX_PER_CM * 2.54)
@@ -804,7 +805,7 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
 
     import subprocess, numpy as np, re, html as _html
 
-    os.makedirs(r"C:\Varsany\Temp", exist_ok=True)
+    os.makedirs(TEMP_FOLDER, exist_ok=True)
 
     # ── STRATEGY A: glyph-collage SVG (single Chrome call, correct font colours) ─
     # Each unique character is rendered as an inline SVG <img> data-URL element.
@@ -934,8 +935,8 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
 <div class="c">{items_html}</div>
 </body></html>"""
 
-        html_path = r"C:\Varsany\Temp\glyph_collage.html"
-        png_path  = r"C:\Varsany\Temp\glyph_collage.png"
+        html_path = os.path.join(TEMP_FOLDER, "glyph_collage.html")
+        png_path  = os.path.join(TEMP_FOLDER, "glyph_collage.png")
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(html_src)
         try:
@@ -1082,8 +1083,8 @@ html,body{{background:{bg};width:{canvas_w}px}}
 {lines_html}
 </body></html>"""
 
-        html_path = r"C:\Varsany\Temp\premium_font.html"
-        png_path  = r"C:\Varsany\Temp\premium_font.png"
+        html_path = os.path.join(TEMP_FOLDER, "premium_font.html")
+        png_path  = os.path.join(TEMP_FOLDER, "premium_font.png")
 
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(html_src)
@@ -1176,7 +1177,7 @@ html,body{{background:{bg};width:{canvas_w}px}}
     glyph_px   = max(150, min(400, canvas_w // max(1, max_chars)))
     scale      = glyph_px / vb_h
     line_h     = max(10, int(vb_h * scale * 1.1))
-    profile_dir = r"C:\Varsany\Temp\chrome_profile"   # shared — calls are sequential
+    profile_dir = os.path.join(TEMP_FOLDER, "chrome_profile")  # shared — calls are sequential
 
     def render_glyph_svg(gid):
         """Render one glyph → RGBA image, or (None, adv_px) on failure."""
@@ -1217,8 +1218,8 @@ html,body{{background:{bg};width:{canvas_w}px}}
                     svg = re.sub(r'(<svg[^>]*>)', r'\1' + hide_css, svg, count=1)
                     break
 
-        svg_path = rf"C:\Varsany\Temp\glyph_{gid}.svg"
-        png_path = rf"C:\Varsany\Temp\glyph_{gid}.png"
+        svg_path = os.path.join(TEMP_FOLDER, f"glyph_{gid}.svg")
+        png_path = os.path.join(TEMP_FOLDER, f"glyph_{gid}.png")
 
         try:
             if os.path.exists(png_path):
@@ -1314,7 +1315,7 @@ html,body{{background:{bg};width:{canvas_w}px}}
         # Save first line as debug reference
         if not line_images:
             try:
-                line_img.save(r"C:\Varsany\Temp\debug_line0.png")
+                line_img.save(os.path.join(TEMP_FOLDER, "debug_line0.png"))
             except Exception:
                 pass
 
@@ -2233,8 +2234,8 @@ def mark_complete(detail_id, out_path):
 
 # ─── GOOGLE DRIVE UPLOAD ──────────────────────────────────────────────────────
 
-GDRIVE_CREDENTIALS  = r"C:\Varsany\credentials.json"
-GDRIVE_TOKEN        = r"C:\Varsany\gdrive_token.json"
+GDRIVE_CREDENTIALS  = os.environ.get("GDRIVE_CREDENTIALS", os.path.join(_base, "credentials.json"))
+GDRIVE_TOKEN        = os.environ.get("GDRIVE_TOKEN",       os.path.join(_base, "gdrive_token.json"))
 GDRIVE_ROOT_FOLDER  = "1ZObOngMUAQo519ThI0vEckR4waKp7bsj"   # shared Drive folder
 GDRIVE_SCOPES       = ["https://www.googleapis.com/auth/drive.file"]
 
