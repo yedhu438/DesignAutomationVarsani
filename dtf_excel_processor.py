@@ -20,12 +20,12 @@ Output:
 
 import os, json, struct, io, traceback, argparse, textwrap
 from datetime import datetime
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-EXCEL_FILE    = r"W:\test4\UnshippedDTFOrders_16042026_013539.xlsx"
-IMAGE_FOLDER  = r"W:\test4\DTFUnshippedImages_20260416_013516"
+EXCEL_FILE    = r"W:\test 8\UnshippedDTFOrders_20042026_014056.xlsx"
+IMAGE_FOLDER  = r"W:\test 8\DTFUnshippedImages_20260420_014001"
 OUTPUT_FOLDER = r"C:\Varsany\Output\DTF_Excel"
 FONT_FOLDERS  = [r"C:\Varsany\Fonts", r"W:\fonts"]
 LOG_FILE      = r"C:\Varsany\Output\DTF_Excel\dtf_excel_log.txt"
@@ -161,6 +161,7 @@ FONT_ALIASES = {
     "arial":           "arial",
     "arialbold":       "arial",
     "abel":            "abel",
+    "bebasneue":       "bebasneueregular",
     "bebasneuepro":    "bebasneueregular",
     "bebasneuefree":   "bebasneueregular",
     "chewy":           "chewyregular",
@@ -225,9 +226,13 @@ def parse_text_lines(row, zone):
         try:
             data = json.loads(tjson)
             if isinstance(data, dict):
-                lines = [str(data[k]).strip()
-                         for k in sorted(data.keys())
-                         if k.lower().startswith('text') and _safe(data.get(k))]
+                lines = []
+                for k in sorted(data.keys()):
+                    if k.lower().startswith('text') and _safe(data.get(k)):
+                        val = str(data[k]).replace('\\n', '\n')
+                        for part in val.split('\n'):
+                            if part.strip():
+                                lines.append(part.strip())
                 if lines:
                     return lines
         except Exception:
@@ -378,15 +383,24 @@ def should_remove_bg(img_path, sku, row, zone):
     except Exception:
         return False
 
+_bg_remove_cache: dict = {}
+BG_CACHE_DIR = r"C:\Varsany\Temp\bg_cache"
+os.makedirs(BG_CACHE_DIR, exist_ok=True)
+
+def _bg_cache_path(img_path):
+    import hashlib
+    h = hashlib.md5(img_path.encode()).hexdigest()
+    return os.path.join(BG_CACHE_DIR, h + ".png")
+
 def remove_background(img_path):
-    """
-    Remove background from image.
-    Strategy:
-      1. rembg (isnet-general-use model) for subject isolation
-      2. Post-process: flood-fill from edges to remove remaining
-         background-coloured pixels rembg missed
-      3. Hard alpha threshold — no soft semi-transparent fringing
-    """
+    if img_path in _bg_remove_cache:
+        return _bg_remove_cache[img_path]
+    # Check disk cache first
+    cache_file = _bg_cache_path(img_path)
+    if os.path.exists(cache_file):
+        result = Image.open(cache_file).convert('RGBA')
+        _bg_remove_cache[img_path] = result
+        return result
     import numpy as np
     from rembg import remove as rembg_remove, new_session
 
@@ -478,7 +492,13 @@ def remove_background(img_path):
     alpha = arr[:, :, 3]
     arr[:, :, 3] = np.where(alpha < 128, 0, 255).astype(np.uint8)
 
-    return Image.fromarray(arr, 'RGBA')
+    result = Image.fromarray(arr, 'RGBA')
+    _bg_remove_cache[img_path] = result
+    try:
+        result.save(cache_file)
+    except Exception:
+        pass
+    return result
 
 # ─── IMAGE LOOKUP ─────────────────────────────────────────────────────────────
 
@@ -643,9 +663,47 @@ def write_psd(out_path, canvas_w, canvas_h, layers):
         f.write(buf.getvalue())
     return out_path   # may have changed extension to .psb
 
+# ─── AI UPSCALER (Real-ESRGAN) ────────────────────────────────────────────────
+
+
+_ESRGAN_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'esrgan_helper.py')
+_ESRGAN_MODEL  = r'C:\Varsany\realesrgan\RealESRGAN_x4plus.pth'
+
+def _sharpen(img_pil):
+    """Apply unsharp mask + sharpness boost for crisp DTF output."""
+    from PIL import ImageFilter, ImageEnhance
+    mode = img_pil.mode
+    # Work on RGB(A) — split alpha to avoid sharpening transparent edges
+    if mode == 'RGBA':
+        r, g, b, a = img_pil.split()
+        rgb = Image.merge('RGB', (r, g, b))
+    else:
+        rgb = img_pil.convert('RGB')
+        a = None
+    # Unsharp mask: radius=1.5, percent=160, threshold=3
+    rgb = rgb.filter(ImageFilter.UnsharpMask(radius=1.5, percent=160, threshold=3))
+    # Additional sharpness enhancer (1.0 = original, 2.0 = double)
+    rgb = ImageEnhance.Sharpness(rgb).enhance(1.4)
+    if a is not None:
+        r, g, b = rgb.split()
+        return Image.merge('RGBA', (r, g, b, a))
+    return rgb.convert(mode) if mode != 'RGB' else rgb
+
+
+def upscale_image(img_pil, target_w, target_h):
+    """Upscale to at least target size using LANCZOS + sharpening."""
+    src_w, src_h = img_pil.size
+    ratio = max(target_w / src_w, target_h / src_h)
+    if ratio > 1.0:
+        nw = max(1, int(src_w * ratio))
+        nh = max(1, int(src_h * ratio))
+        img_pil = img_pil.resize((nw, nh), Image.LANCZOS)
+    return _sharpen(img_pil)
+
+
 # ─── LAYER BUILDERS ───────────────────────────────────────────────────────────
 
-def build_image_layer(img_path, w, h, do_bg_remove=False):
+def build_image_layer(img_path, w, h, do_bg_remove=False, upscale=True):
     """Scale image to fit within zone (aspect-ratio preserved). Optionally removes background."""
     if not img_path or not os.path.isfile(img_path):
         return Image.new('RGBA', (max(1, w), max(1, h)), (0, 0, 0, 0)), 0, 0
@@ -663,22 +721,22 @@ def build_image_layer(img_path, w, h, do_bg_remove=False):
             src = Image.open(img_path).convert('RGBA')
     else:
         src = ImageOps.exif_transpose(Image.open(img_path)).convert('RGBA')
-    # Scale to fit within canvas dimensions — whichever side is the limiting factor.
-    # If width already matches, don't stretch height beyond canvas; vice-versa.
+        # Auto-crop transparent borders from customer-uploaded images
+        bbox = src.getbbox()
+        if bbox and (bbox[0] > 0 or bbox[1] > 0 or bbox[2] < src.width or bbox[3] < src.height):
+            src = src.crop(bbox)
+    # AI upscale to canvas size, then final exact resize if needed.
     ratio_w = w / src.width
     ratio_h = h / src.height
     ratio   = min(ratio_w, ratio_h)
-    nw      = max(1, int(src.width  * ratio))
-    nh      = max(1, int(src.height * ratio))
-    src     = src.resize((nw, nh), Image.LANCZOS)
-    # Sharpen after upscaling — LANCZOS softens slightly, unsharp mask restores crispness
-    alpha = src.split()[3] if src.mode == 'RGBA' else None
-    rgb   = src.convert('RGB').filter(ImageFilter.UnsharpMask(radius=2, percent=200, threshold=2))
-    if alpha is not None:
-        r, g, b = rgb.split()
-        src = Image.merge('RGBA', (r, g, b, alpha))
-    else:
-        src = rgb.convert('RGBA')
+    target_w = max(1, int(src.width  * ratio))
+    target_h = max(1, int(src.height * ratio))
+    src = upscale_image(src, target_w, target_h) if upscale else src.resize((target_w, target_h), Image.LANCZOS)
+    # ESRGAN may slightly overshoot/undershoot — snap to exact target
+    if src.width != target_w or src.height != target_h:
+        src = src.resize((target_w, target_h), Image.LANCZOS)
+    nw, nh = src.width, src.height
+    src = src.convert('RGBA')
     # Centre horizontally within zone if image is narrower than zone width
     left_offset = (w - nw) // 2
     return src, 0, left_offset
@@ -717,8 +775,12 @@ def auto_wrap_lines(lines, font_name, w, h):
     for n in range(2, min(len(words), 6)):
         candidate = _distribute_words(words, n)
         if len(candidate) > 1:
+            # Reject orphan layouts: skip if any line is <40% the length of the longest
+            lengths = [len(l) for l in candidate]
+            if min(lengths) < max(lengths) * 0.4:
+                continue
             sz = find_best_font_size(candidate, font_name, w, h)
-            if sz > best_size:
+            if sz > best_size * 1.15:   # only wrap if 15%+ font-size gain
                 best_size, best_lines = sz, candidate
     return best_lines
 
@@ -779,6 +841,7 @@ def _is_emoji_char(c):
         0x00A9 <= cp <= 0x00AE or       # © ®
         0x2000 <= cp <= 0x27FF or       # Misc symbols, arrows, dingbats
         0x2900 <= cp <= 0x2BFF or       # More arrows, misc symbols
+        0x1F1E0 <= cp <= 0x1F1FF or     # Regional indicator symbols (flag emojis 🇯🇲 🇬🇧 etc)
         0x1F300 <= cp <= 0x1FAFF or     # All modern emoji blocks (faces, objects, flags …)
         0xFE00 <= cp <= 0xFE0F or       # Variation selectors (emoji vs text presentation)
         cp == 0x200D                    # ZWJ
@@ -807,9 +870,9 @@ def _pilmoji_measure(line, font):
         with Pilmoji(tmp, **kwargs) as p:
             return p.getsize(line, font=font)
     except Exception:
-        tmp = Image.new('RGBA', (1, 1))
-        bb = ImageDraw.Draw(tmp).textbbox((0, 0), line, font=font)
-        return bb[2] - bb[0], bb[3] - bb[1]
+        pass
+    bb = ImageDraw.Draw(Image.new('RGBA', (1, 1))).textbbox((0, 0), line, font=font)
+    return bb[2] - bb[0], bb[3] - bb[1]
 
 
 def _pilmoji_draw(img, x, y, line, font, fill):
@@ -831,10 +894,15 @@ def _render_line_to_strip(line, font, colour, use_emoji, pad=200):
     Returns a PIL Image (RGBA) containing only the inked pixels.
     """
     r, g, b = colour
-    scratch  = Image.new('RGBA', (1, 1))
-    bb       = ImageDraw.Draw(scratch).textbbox((0, 0), line or 'Ag', font=font)
-    est_w    = max(bb[2] - bb[0], 10) + pad * 2
-    est_h    = max(bb[3] - bb[1], 10) + pad * 2
+    if use_emoji:
+        mw, mh   = _pilmoji_measure(line or 'Ag', font)
+        est_w    = max(mw, 10) + pad * 2
+        est_h    = max(mh, 10) + pad * 2
+    else:
+        scratch  = Image.new('RGBA', (1, 1))
+        bb       = ImageDraw.Draw(scratch).textbbox((0, 0), line or 'Ag', font=font)
+        est_w    = max(bb[2] - bb[0], 10) + pad * 2
+        est_h    = max(bb[3] - bb[1], 10) + pad * 2
     strip    = Image.new('RGBA', (max(1, est_w), max(1, est_h)), (0, 0, 0, 0))
     if use_emoji:
         _pilmoji_draw(strip, pad, pad, line, font, (r, g, b, 255))
@@ -844,7 +912,7 @@ def _render_line_to_strip(line, font, colour, use_emoji, pad=200):
     if bbox:
         return strip.crop(bbox)
     # blank line — return a transparent sliver with the right height
-    return Image.new('RGBA', (1, max(bb[3] - bb[1], 10)), (0, 0, 0, 0))
+    return Image.new('RGBA', (1, max(est_h - pad * 2, 10)), (0, 0, 0, 0))
 
 
 def _render_text(lines, font_name, colour_hex, w, font_size):
@@ -888,6 +956,12 @@ def _render_text(lines, font_name, colour_hex, w, font_size):
             text, font=font, fill=(r, g, b, 255),
             spacing=0, align='center'
         )
+
+    # Safety clamp: if rendered text wider than canvas, scale down to fit
+    if img.width > w * 0.95:
+        scale = (w * 0.92) / img.width
+        img   = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+        img_w = img.width
 
     left = (w - img_w) // 2
     return img, 0, left
@@ -1206,7 +1280,7 @@ def process_excel_orders(limit=None, dry_run=False, order_id=None):
                     content_h = max(content_h, tt + txt_pil.height)
 
                 if zone['prev_path']:
-                    prev_pil, pt, pl = build_image_layer(zone['prev_path'], zw, zh)
+                    prev_pil, pt, pl = build_image_layer(zone['prev_path'], zw, zh, upscale=False)
                     zone_layers.append((f"{zone['label']} Preview Reference", prev_pil, pt, pl, False))
                     # preview is hidden — don't include in content_h
 
