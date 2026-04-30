@@ -591,10 +591,8 @@ def write_psd(out_path, canvas_w, canvas_h, layers):
     Falls back to a raw binary writer for PSB (canvas > 30 000px) since
     psd-tools does not support the PSB (version 2) format.
     """
-    PSB_MAX = 30000
-    use_psb = canvas_w > PSB_MAX or canvas_h > PSB_MAX
-    if use_psb and out_path.lower().endswith('.psd'):
-        out_path = out_path[:-4] + '.psb'
+    # Always write PSD — printing software does not support PSB
+    use_psb = False
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 

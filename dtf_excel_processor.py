@@ -653,12 +653,8 @@ def write_psd(out_path, canvas_w, canvas_h, layers):
     Auto-switches to PSB when estimated size exceeds 1.5 GB.
     Layers: list of dicts with image/top/left/name/opacity/visible.
     """
-    # Estimate uncompressed size: canvas pixels × 4 bytes × layers
-    est_bytes = canvas_w * canvas_h * 4 * (len(layers) + 1)
-    psb = est_bytes > 1.5 * 1024**3   # use PSB if >1.5 GB estimated
-
-    if psb and out_path.endswith('.psd'):
-        out_path = out_path[:-4] + '.psb'
+    # Always write PSD — printing software does not support PSB
+    psb = False
 
     # PSB uses 8-byte length fields; PSD uses 4-byte
     ch_len_fmt   = '>hQ' if psb else '>hI'   # channel data length in layer record
