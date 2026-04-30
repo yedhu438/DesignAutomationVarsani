@@ -50,6 +50,17 @@ IMAGE_FOLDERS = [
     r"C:\Varsany\Uploads",
 ]
 
+# Auto-discover W:\test*\DTFUnshippedImages_* bulk download folders
+_W = r"W:\\"
+if os.path.exists(_W):
+    for _entry in os.listdir(_W):
+        if _entry.lower().startswith("test"):
+            _test_dir = os.path.join(_W, _entry)
+            if os.path.isdir(_test_dir):
+                for _sub in os.listdir(_test_dir):
+                    if _sub.startswith("DTFUnshippedImages"):
+                        IMAGE_FOLDERS.append(os.path.join(_test_dir, _sub))
+
 FONT_FOLDERS = [
     r"C:\Varsany\Fonts",
     r"W:\fonts",
@@ -837,7 +848,9 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
         # We cap at 2400px so the collage HTML doesn't exceed Chrome's limits.
         max_chars = max(len(l) for l in real_lines if l)
         target_w  = int(canvas_w * 0.85 / max(1, max_chars))   # px per char
-        glyph_h   = max(600, min(2400, target_w * 2))
+        # Use ×4 multiplier so glyphs render at high resolution before any
+        # scale-to-canvas step — prevents blurring on upscale.
+        glyph_h   = max(800, min(2400, target_w * 4))
 
         # vb_h_render: viewBox height used when rendering each glyph.
         # Must span from top of ascenders (-ascender) down to below baseline.
@@ -925,8 +938,9 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
 <div class="c">{items_html}</div>
 </body></html>"""
 
-        html_path = r"C:\Varsany\Temp\glyph_collage.html"
-        png_path  = r"C:\Varsany\Temp\glyph_collage.png"
+        _pid      = os.getpid()
+        html_path = rf"C:\Varsany\Temp\glyph_collage_{_pid}.html"
+        png_path  = rf"C:\Varsany\Temp\glyph_collage_{_pid}.png"
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(html_src)
         try:
@@ -936,7 +950,7 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
             pass
 
         cmd = [
-            CHROME_EXE, "--headless=old", "--no-sandbox",
+            CHROME_EXE, "--headless", "--no-sandbox",
             "--disable-gpu", "--disable-extensions",
             "--no-first-run", "--disable-sync",
             f"--screenshot={png_path}",
@@ -961,7 +975,7 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
         dpr = collage_img.width / collage_w if collage_w > 0 else 1.0
 
         # ── Crop individual glyphs from collage ───────────────────────────────
-        glyph_imgs = {}
+        glyph_imgs_raw = {}
         for ch, (adv_px, h_px, _) in char_svg.items():
             x0 = int(x_pos[ch] * dpr)
             x1 = int((x_pos[ch] + adv_px) * dpr)
@@ -973,14 +987,69 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
             arr = np.array(crop)
             white = (arr[:, :, 0] > 240) & (arr[:, :, 1] > 240) & (arr[:, :, 2] > 240)
             arr[white, 3] = 0
-            glyph_imgs[ch] = Image.fromarray(arr) if arr[:, :, 3].max() > 0 else None
+            img_rgba = Image.fromarray(arr)
+            bbox = img_rgba.getbbox()
+            # Crop to visible content bbox so we know the real pixel size
+            glyph_imgs_raw[ch] = img_rgba.crop(bbox) if (bbox and arr[:, :, 3].max() > 0) else None
 
-        if not any(v is not None for v in glyph_imgs.values()):
+        if not any(v is not None for v in glyph_imgs_raw.values()):
             log(f"  Collage render: all glyphs transparent for {font_name}", "WARN")
             return None
 
+        # Normalise glyphs within each typographic class to a uniform height.
+        # Uppercase + digits  → cap_h  (normalise all to the tallest uppercase glyph)
+        # Lowercase           → x_h    (normalise all to the tallest lowercase glyph)
+        # Punctuation/symbols → keep natural size (never scale up a tiny apostrophe)
+        # This preserves the visual uppercase/lowercase distinction.
+        import string as _string
+        _UPPER = set(_string.ascii_uppercase + _string.digits)
+        _LOWER = set(_string.ascii_lowercase)
+        _upper_hs = [g.height for ch, g in glyph_imgs_raw.items() if g is not None and ch in _UPPER]
+        _lower_hs = [g.height for ch, g in glyph_imgs_raw.items() if g is not None and ch in _LOWER]
+        cap_h = max(_upper_hs, default=None)
+        x_h   = max(_lower_hs, default=None)
+        if cap_h is None: cap_h = x_h or 1
+        if x_h   is None: x_h   = cap_h
+        max_content_h = cap_h   # line_h is always driven by cap height
+
+        glyph_imgs    = {}
+        glyph_base_y  = {}      # per-char vertical offset when pasting into line_img
+        for ch, gimg in glyph_imgs_raw.items():
+            if gimg is None:
+                glyph_imgs[ch] = None
+                continue
+            if ch in _UPPER:
+                target_h = cap_h
+                base_y   = 0                        # sit at top of line
+            elif ch in _LOWER:
+                target_h = x_h
+                base_y   = cap_h - x_h             # baseline-align (sit at bottom)
+            else:
+                # Punctuation/symbol: if the font has an explicit SVG glyph for it,
+                # the designer made it a full display character → scale to cap_h.
+                # Characters not in the SVG table have no designed size so keep natural.
+                if ch in char_svg:
+                    target_h = cap_h
+                    base_y   = 0
+                else:
+                    target_h = gimg.height
+                    base_y   = max(0, (cap_h - gimg.height) // 2)  # vertically centred
+            if gimg.height != target_h:
+                sf   = target_h / gimg.height
+                nw   = max(1, int(gimg.width * sf))
+                gimg = gimg.resize((nw, target_h), Image.LANCZOS)
+            glyph_imgs[ch]   = gimg
+            glyph_base_y[ch] = base_y
+
         # ── Compose text lines ────────────────────────────────────────────────
-        line_h     = collage_h
+        # Advance width = max(hmtx advance, actual content width + small gap).
+        # Using hmtx alone causes overlaps when short glyphs are normalised up
+        # to max_content_h (width scales up too, exceeding the advance cell).
+        norm_scale = max_content_h / max(1, glyph_h)
+        space_em   = hmtx.get('space', hmtx.get('uni0020', (upem // 3, 0)))[0]
+        space_w    = max(4, int(space_em * norm_scale * glyph_h / upem))
+        min_gap    = max(4, max_content_h // 20)   # ~5% of cap height between letters
+        line_h     = max_content_h
         line_imgs  = []
         for line_text in text_lines:
             if not line_text.strip():
@@ -989,34 +1058,46 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
             x = 0
             parts = []
             for ch in line_text:
+                gimg = glyph_imgs.get(ch)
                 if ch in char_svg:
-                    adv_px = char_svg[ch][0]
+                    adv_px_at_glyph_h = char_svg[ch][0]
+                    adv_hmtx = max(1, int(adv_px_at_glyph_h * norm_scale))
+                    # Never let advance be smaller than the glyph content —
+                    # that would cause letters to overlap each other.
+                    content_w = gimg.width if gimg is not None else 0
+                    adv = max(adv_hmtx, content_w + min_gap)
+                    gx_offset = max(0, (adv - content_w) // 2)
                 else:
-                    adv_px = max(1, int((upem // 3) * scale))
-                parts.append((glyph_imgs.get(ch), x, adv_px))
-                x += adv_px
+                    adv = space_w
+                    gx_offset = 0
+                parts.append((ch, gimg, x + gx_offset))
+                x += adv
             if x <= 0:
                 line_imgs.append(None)
                 continue
             line_img = Image.new("RGBA", (x, line_h), (0, 0, 0, 0))
-            for gimg, gx, adv_px in parts:
+            for ch, gimg, gx in parts:
                 if gimg is not None:
-                    line_img.paste(gimg, (gx, 0), gimg)
+                    gy = glyph_base_y.get(ch, 0)
+                    line_img.paste(gimg, (gx, gy), gimg)
             line_imgs.append(line_img)
 
         valid = [li for li in line_imgs if li is not None]
         if not valid:
             return None
 
-        # Stack lines, centred on canvas_w
-        total_h = line_h * len(line_imgs)
-        result  = Image.new("RGBA", (canvas_w, max(1, total_h)), (0, 0, 0, 0))
+        # Stack lines — use actual max line width to prevent right-edge clipping
+        line_gap   = max(line_h // 3, 40)  # ~33% of cap height between lines
+        n_lines    = len(line_imgs)
+        total_h    = line_h * n_lines + line_gap * max(0, n_lines - 1)
+        max_line_w = max((limg.width for limg in line_imgs if limg is not None), default=canvas_w)
+        result     = Image.new("RGBA", (max_line_w, max(1, total_h)), (0, 0, 0, 0))
         y = 0
         for limg in line_imgs:
             if limg is not None:
-                cx2 = max(0, (canvas_w - limg.width) // 2)
+                cx2 = max(0, (max_line_w - limg.width) // 2)
                 result.paste(limg, (cx2, y), limg)
-            y += line_h
+            y += line_h + line_gap
 
         bbox = result.getbbox()
         if not bbox:
@@ -1024,8 +1105,6 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
         result = result.crop(bbox)
 
         # Scale to fill ~85% of canvas width — same as the PIL renderer does.
-        # Without this the glyphs are rendered at a fixed small size and appear
-        # tiny on the large canvas.
         avail_w = int(canvas_w * 0.85)
         if result.width > 0 and result.width != avail_w:
             ratio   = avail_w / result.width
@@ -1070,8 +1149,9 @@ html,body{{background:{bg};width:{canvas_w}px}}
 {lines_html}
 </body></html>"""
 
-        html_path = r"C:\Varsany\Temp\premium_font.html"
-        png_path  = r"C:\Varsany\Temp\premium_font.png"
+        _pid      = os.getpid()
+        html_path = rf"C:\Varsany\Temp\premium_font_{_pid}.html"
+        png_path  = rf"C:\Varsany\Temp\premium_font_{_pid}.png"
 
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(html_src)
@@ -1082,7 +1162,7 @@ html,body{{background:{bg};width:{canvas_w}px}}
             pass
 
         cmd = [
-            CHROME_EXE, "--headless=old", "--no-sandbox",
+            CHROME_EXE, "--headless", "--no-sandbox",
             "--disable-gpu", "--disable-extensions",
             "--allow-file-access-from-files",
             "--no-first-run", "--disable-sync",
@@ -1222,7 +1302,7 @@ html,body{{background:{bg};width:{canvas_w}px}}
             f.write(svg)
 
         cmd = [
-            CHROME_EXE, "--headless=old", "--no-sandbox",
+            CHROME_EXE, "--headless", "--no-sandbox",
             "--disable-gpu", "--disable-extensions",
             "--no-first-run", "--disable-sync",
             f"--user-data-dir={profile_dir}",
@@ -1318,14 +1398,16 @@ html,body{{background:{bg};width:{canvas_w}px}}
         return None
 
     # Assemble lines on canvas
-    total_h = line_h * len(line_images)
-    result  = Image.new("RGBA", (canvas_w, max(1, total_h)), (0, 0, 0, 0))
-    y       = 0
+    line_gap = max(line_h // 3, 40)  # ~33% of cap height between lines
+    n_lines  = len(line_images)
+    total_h  = line_h * n_lines + line_gap * max(0, n_lines - 1)
+    result   = Image.new("RGBA", (canvas_w, max(1, total_h)), (0, 0, 0, 0))
+    y        = 0
     for limg in line_images:
         if limg is not None:
             cx = max(0, (canvas_w - limg.width) // 2)
             result.paste(limg, (cx, y), limg)
-        y += line_h
+        y += line_h + line_gap
 
     bbox = result.getbbox()
     if not bbox:

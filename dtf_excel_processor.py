@@ -173,7 +173,57 @@ FONT_ALIASES = {
     "latobold":        "latobold",
     "roboto":          "roboto",
     "verdana":         "verdana",
+    # Premium texture fonts — DB display name (spaces stripped) → FONT_INDEX key
+    "texturefont":          "smartkids",
+    "texture":              "smartkids",
+    "blockfont":            "colorfulblocks",
+    "colorfulblock":        "colorfulblocks",
+    "colorfulblocks":       "colorfulblocks",
+    "paintfont":            "paintsplashesrainbow",
+    "paintsplashes":        "paintsplashesrainbow",
+    "paintsplashesrainbow": "paintsplashesrainbow",
+    "mermaidfont":          "wavemermaid",
+    "mermaid":              "wavemermaid",
+    "wavemermaid":          "wavemermaid",
+    "reflectionfont":       "refractionray",
+    "reflection":           "refractionray",
+    "refractionray":        "refractionray",
+    "camofont":             "camoblock",
+    "camo":                 "camoblock",
+    "camoblock":            "camoblock",
+    "spideyfont":           "spiderweb",
+    "spidey":               "spiderweb",
+    "spiderweb":            "spiderweb",
+    "cozyfont":             "cozywinter",
+    "cozy":                 "cozywinter",
+    "cozywinter":           "cozywinter",
+    "footballfont":         "soccerarmy",
+    "football":             "soccerarmy",
+    "soccerarmy":           "soccerarmy",
+    "vinyl":                "vinylfont",
+    "vinylfont":            "vinylfont",
+    "bouqet":               "bouqetdisplay",
+    "bouqetdisplay":        "bouqetdisplay",
+    "smartkids":            "smartkids",
 }
+
+# Every font in this set is a premium colour/texture font — rendered via Chrome
+# to preserve its built-in SVG glyph colours.  Customer colour is IGNORED for
+# these fonts; colour comes from the font's own SVG glyph data.
+PREMIUM_FONT_KEYS = {
+    "smartkids", "colorfulblocks", "paintsplashesrainbow",
+    "wavemermaid", "refractionray", "camoblock", "spiderweb",
+    "cozywinter", "soccerarmy", "vinylfont", "bouqetdisplay",
+}
+
+def _resolve_font_key(font_name):
+    if not font_name:
+        return None
+    norm = font_name.lower().replace(' ', '').replace('-', '').replace('_', '')
+    alias = FONT_ALIASES.get(norm)
+    if alias is not None:
+        return alias
+    return norm if norm in FONT_INDEX else None
 
 def get_font(font_name, size_px):
     """Resolve font name to a PIL ImageFont, falling back to Arial."""
@@ -196,6 +246,33 @@ def get_font(font_name, size_px):
         return ImageFont.truetype("arial.ttf", size_px)
     except Exception:
         return ImageFont.load_default()
+
+def _test_font_renders(path):
+    """Return True if this font produces visible pixels when PIL renders 'A'."""
+    try:
+        import numpy as _np
+        _f   = ImageFont.truetype(path, 200)
+        _img = Image.new("RGBA", (300, 300), (0, 0, 0, 0))
+        ImageDraw.Draw(_img).text((10, 10), "A", font=_f, fill=(0, 0, 0, 255))
+        return _np.array(_img)[:, :, 3].max() > 0
+    except Exception:
+        return False
+
+SVG_ONLY_FONT_KEYS = {k for k, p in FONT_INDEX.items() if not _test_font_renders(p)}
+
+def _is_svg_only_font(font_name):
+    return _resolve_font_key(font_name) in SVG_ONLY_FONT_KEYS
+
+def _is_premium_font(font_name):
+    return _resolve_font_key(font_name) in PREMIUM_FONT_KEYS
+
+# Chrome renderer — shared with batch_processor
+try:
+    from batch_processor import build_text_layer_chrome as _chrome_render
+    _CHROME_AVAILABLE = True
+except Exception:
+    _CHROME_AVAILABLE = False
+    _chrome_render = None
 
 # ─── TEXT PARSING HELPERS ─────────────────────────────────────────────────────
 
@@ -790,6 +867,25 @@ def build_text_layer(text_lines, font_name, colour_hex, w, h, force_size=None):
     lines = [l for l in text_lines if l.strip()]
     if not lines:
         return Image.new('RGBA', (1, 1), (0, 0, 0, 0)), 0, 0
+
+    # Premium / SVG colour fonts: render via Chrome to preserve built-in glyph
+    # colours (spider-web pattern, colour blocks, paint splashes, etc.).
+    # Customer colour is ALWAYS ignored — the font's own SVG data defines colour.
+    if _CHROME_AVAILABLE and (_is_svg_only_font(font_name) or _is_premium_font(font_name)):
+        img = _chrome_render(lines, font_name, None, w)
+        if img is not None:
+            left = max(0, (w - img.width) // 2)
+            # force_size: scale Chrome output proportionally if caller requires it
+            if force_size is not None:
+                natural = find_best_font_size(lines, font_name, w, h)
+                if natural > 0 and force_size != natural:
+                    scale = force_size / natural
+                    nw = max(1, int(img.width  * scale))
+                    nh = max(1, int(img.height * scale))
+                    img = img.resize((nw, nh), Image.LANCZOS)
+                    left = max(0, (w - img.width) // 2)
+            return img, 0, left
+
     lines = auto_wrap_lines(lines, font_name, w, h)
     best = find_best_font_size(lines, font_name, w, h, force_size)
     return _render_text(lines, font_name, colour_hex, w, best)
@@ -1121,8 +1217,9 @@ def process_excel_orders(limit=None, dry_run=False, order_id=None):
         groups[oid].append(row)
 
     if order_id:
-        groups = {k: v for k, v in groups.items() if k == order_id}
-        log(f'Filter        : order {order_id} only')
+        ids = order_id if isinstance(order_id, list) else [order_id]
+        groups = {k: v for k, v in groups.items() if k in ids}
+        log(f'Filter        : {len(ids)} order(s): {", ".join(ids)}')
 
     total_orders = len(groups)
     log(f'Unique orders : {total_orders}')
@@ -1367,6 +1464,15 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='DTF Excel Order Processor')
     parser.add_argument('--limit',   type=int, default=None, help='Max orders to process')
     parser.add_argument('--dry-run', action='store_true',    help='Preview only, no files written')
-    parser.add_argument('--order',   type=str, default=None, help='Process a single order ID only')
+    parser.add_argument('--order',   type=str, default=None, action='append', help='Process specific OrderID(s) — can be repeated')
+    parser.add_argument('--excel',   type=str, default=None, help='Path to Excel file (overrides EXCEL_FILE)')
+    parser.add_argument('--images',  type=str, default=None, help='Path to images folder (overrides IMAGE_FOLDER)')
+    parser.add_argument('--dpi',     type=int, default=None, help='Resolution px/cm (120=304dpi, 320=812dpi)')
     args = parser.parse_args()
-    process_excel_orders(limit=args.limit, dry_run=args.dry_run, order_id=args.order)
+    if args.excel:
+        EXCEL_FILE = args.excel
+    if args.images:
+        IMAGE_FOLDER = args.images
+    if args.dpi:
+        PX_PER_CM = args.dpi
+    process_excel_orders(limit=args.limit, dry_run=args.dry_run, order_id=args.order or None)
