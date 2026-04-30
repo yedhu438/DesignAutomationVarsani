@@ -1,7 +1,28 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python prototype_app.py)"
+      "Bash(python prototype_app.py)",
+      "Bash(python analyze_tysh.py)",
+      "Bash(mkdir -p \"w:\\VarsaniAutomation\\Temp\")",
+      "Bash(python extract_enginedata.py)",
+      "Bash(python build_enginedata.py)",
+      "Bash(python fix_tysh.py)",
+      "Bash(timeout 3 bash -c \"sleep 2 && echo ''Flask started''\")",
+      "Read(//c/Varsany/Output/**)",
+      "Bash(python -)",
+      "Bash(python batch_processor.py --order 026-0396772-4452309 --order 026-0394801-9412301)",
+      "Bash(python batch_processor.py --limit 20 --sku-filter MenTee,WmnTee,KidsTee,AdultTee)",
+      "Bash(C:\\\\Users\\\\yedhu\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python313\\\\python.exe -c \"from rembg import remove; print\\('rembg OK'\\)\")",
+      "Bash(python batch_processor.py --order 205-8576515-9490735 --reprocess)",
+      "Bash(python -c \" import os for root, dirs, files in os.walk\\('Z:/'\\): for f in files: if '59311680467362' in f: print\\(os.path.join\\(root, f\\)\\) break \")",
+      "Bash(python -c ':*)",
+      "Bash(python batch_processor.py --order \"205-8658507-5400304\" --reprocess)",
+      "Bash(python batch_processor.py --order \"026-7464958-3819532\" --reprocess)",
+      "Bash(python batch_processor.py --date 2026-02-28 --reprocess --gdrive)",
+      "Bash(python batch_processor.py --date-after 2026-04-10)",
+      "Bash(net use:*)",
+      "Read(//w/images/**)",
+      "Bash(python batch_processor.py --limit 5 --date-after 2026-04-05)"
     ],
     "deny": [],
     "ask": []
