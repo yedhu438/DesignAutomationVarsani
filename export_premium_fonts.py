@@ -126,8 +126,27 @@ def fetch_premium_orders(limit=LIMIT):
                 LOWER(ISNULL(d.SleevePremiumFont,'')) IN ('yes','1','true')
             )"""
 
+    # When no dedicated DB columns, filter in SQL via JSON LIKE patterns
+    json_where = ""
+    if not has_db_cols:
+        json_where = """
+            AND (
+                (ISNULL(d.FrontFonts,'')  LIKE '%"PremiumFont":"%'
+                 AND ISNULL(d.FrontFonts,'')  NOT LIKE '%"PremiumFont":""%'
+                 AND ISNULL(d.FrontFonts,'')  NOT LIKE '%"PremiumFont":"No"%') OR
+                (ISNULL(d.BackFonts,'')   LIKE '%"PremiumFont":"%'
+                 AND ISNULL(d.BackFonts,'')   NOT LIKE '%"PremiumFont":""%'
+                 AND ISNULL(d.BackFonts,'')   NOT LIKE '%"PremiumFont":"No"%') OR
+                (ISNULL(d.PocketFonts,'') LIKE '%"PremiumFont":"%'
+                 AND ISNULL(d.PocketFonts,'') NOT LIKE '%"PremiumFont":""%'
+                 AND ISNULL(d.PocketFonts,'') NOT LIKE '%"PremiumFont":"No"%') OR
+                (ISNULL(d.SleeveFonts,'') LIKE '%"PremiumFont":"%'
+                 AND ISNULL(d.SleeveFonts,'') NOT LIKE '%"PremiumFont":""%'
+                 AND ISNULL(d.SleeveFonts,'') NOT LIKE '%"PremiumFont":"No"%')
+            )"""
+
     sql = f"""
-        SELECT TOP {limit * 10}
+        SELECT TOP {limit}
             o.OrderID,
             o.SKU,
             o.ItemType,
@@ -147,8 +166,9 @@ def fetch_premium_orders(limit=LIMIT):
             {premium_select}
         FROM tblCustomOrder o
         JOIN tblCustomOrderDetails d ON o.idCustomOrder = d.idCustomOrder
-        WHERE o.IsShipped = 0
+        WHERE 1=1
           {premium_where}
+          {json_where}
         ORDER BY o.DateAdd ASC
     """
     cur.execute(sql)
@@ -202,7 +222,7 @@ def export(rows, has_db_cols):
         for cell in ws[1]:
             cell.font = XLFont(bold=True)
 
-    print(f"\nExported {len(df)} premium font order(s) → {OUTPUT_FILE}")
+    print(f"\nExported {len(df)} premium font order(s): {OUTPUT_FILE}")
     return OUTPUT_FILE
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────

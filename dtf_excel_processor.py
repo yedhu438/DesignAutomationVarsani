@@ -24,11 +24,12 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-EXCEL_FILE    = r"W:\test 8\UnshippedDTFOrders_20042026_014056.xlsx"
-IMAGE_FOLDER  = r"W:\test 8\DTFUnshippedImages_20260420_014001"
-OUTPUT_FOLDER = r"C:\Varsany\Output\DTF_Excel"
-FONT_FOLDERS  = [r"C:\Varsany\Fonts", r"W:\fonts"]
-LOG_FILE      = r"C:\Varsany\Output\DTF_Excel\dtf_excel_log.txt"
+_test_base    = r"C:\Users\Revathi\OneDrive\Documents\varsany\test 8\test 8"
+EXCEL_FILE    = os.environ.get("DTF_EXCEL",   os.path.join(_test_base, "UnshippedDTFOrders_20042026_014056.xlsx"))
+IMAGE_FOLDER  = os.environ.get("DTF_IMAGES",  os.path.join(_test_base, "DTFUnshippedImages_20260420_014001"))
+OUTPUT_FOLDER = os.environ.get("DTF_OUTPUT",  r"C:\Varsany\Output\DTF_Excel")
+FONT_FOLDERS  = [r"C:\Varsany\Fonts", r"W:\fonts", r"C:\Windows\Fonts"]
+LOG_FILE      = os.path.join(OUTPUT_FOLDER, "dtf_excel_log.txt")
 
 PX_PER_CM = 120          # 304 DPI for test — change to 320 for production
 DPI       = int(PX_PER_CM * 2.54)
