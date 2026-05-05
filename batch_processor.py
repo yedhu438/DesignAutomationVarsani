@@ -114,18 +114,22 @@ for _folder in FONT_FOLDERS:
 # Explicit aliases so database font names map to actual filenames
 FONT_ALIASES = {
     # Standard fonts
+    "abel":             "abelregular",
     "arial":            "arial",
     "arialbold":        "arial",
-    "bebasneuepro":     "bebasneueregular",
     "bebasneuefree":    "bebasneueregular",
+    "bebasneuepro":     "bebasneueregular",
+    "bebasneue":        "bebasneueregular",
     "chewy":            "chewyregular",
     "fondamento":       "fondamentoregular",
-    "permanentmarker":  "permanentmarkerregular",
-    "russoone":         "russooneregular",
-    "ultra":            "ultraregular",
+    "helvetica":        "arial",
     "lato":             "latoregular",
     "latobold":         "latobold",
-    "roboto":           "roboto",
+    "permanentmarker":  "permanentmarkerregular",
+    "roboto":           "robotoregular",
+    "robotoregular":    "robotoregular",
+    "russoone":         "russooneregular",
+    "ultra":            "ultraregular",
     "verdana":          "verdana",
     # Premium texture fonts (database name → FONT_INDEX key)
     "texturefont":      "smartkids",
@@ -165,16 +169,26 @@ FONT_ALIASES = {
     "vinylFont":        "vinylfont",
     "vinyl font":       "vinylfont",
     "vinylfont":        "vinylfont",
-    # Non-print methods (flag to designer — no TTF)
-    "rhinestone":       None,
-    "rhinestoneFont":   None,
-    "rhinestone font":  None,
-    "embroidery":       None,
-    "embroideryFont":   None,
-    "embroidery font":  None,
-    "crystalfont":      None,
-    "varsanycrystal":   None,
-    "varsany crystal":  None,
+    # Non-print methods (flag to designer — no TTF, fall through to Arial placeholder)
+    "rhinestone":                   None,
+    "rhinestonefont":               None,
+    "embroidery":                   None,
+    "embroideryfont":               None,
+    "emroideryfont":                None,
+    "crystalfont":                  None,
+    "varsanycrystal":               None,
+    "varsanycrystalfont":           None,
+    "varsanyrhinestonefont":        None,
+    "25mmcapsrhinestonefont":       None,
+    # Custom fonts — files not yet installed (fall through to Arial)
+    "bsl":                          None,
+    "dtftext":                      None,
+    "glovesfont":                   None,
+    "shortsfont":                   None,
+    "supervibes":                   None,
+    "varsany":                      None,
+    "welliesfont":                  None,
+    "wellisfont":                   None,
 }
 
 print(f"  Fonts indexed: {list(FONT_INDEX.keys())}")
@@ -184,6 +198,19 @@ PREMIUM_FONT_KEYS = {
     "smartkids", "colorfulblocks", "paintsplashesrainbow",
     "wavemermaid", "refractionray", "camoblock", "spiderweb",
     "cozywinter", "soccerarmy", "tropicalflower", "vinylfont",
+}
+
+# Per-font tracking multiplier applied to every hmtx advance width.
+# Full-width glyph images preserve transparent sidebearings, so T < 1.0 is safe when
+# the font has genuine LSB/RSB (the overlap region is transparent, not visible artwork).
+# Fonts whose artwork fills the full advance width must stay at 1.0 to avoid pixel overlap.
+FONT_TRACKING = {
+    # Reflection Font (Refraction Ray.otf): PNG bitmaps in SVG fill only ~65.5% of advance.
+    # Chrome pixel measurement A-Z: mean fill=0.655, min-safe=0.680 (S→T pair).
+    # T=0.68 → letters nearly touching; T=1.0 → ~200px visible gap per letter.
+    "refractionray": 0.68,
+    # camoblock, colorfulblocks, soccerarmy, paintsplashesrainbow, wavemermaid,
+    # cozywinter, smartkids, spiderweb: artwork fills full advance → 1.0 (no entry = default).
 }
 
 def _resolve_font_key(font_name):
@@ -755,9 +782,13 @@ for _p in [
         CHROME_EXE = _p
         break
 
-# Fonts that PIL cannot render visually (SVG/colour-only fonts with empty outlines).
-# Detected by: loading OK but rendering 'A' produces zero visible pixels.
+# Fonts that need Chrome to render correctly:
+#   (a) PIL renders zero pixels (SVG/colour-only, no outline fallback), OR
+#   (b) font has an SVG/COLR/sbix colour table — PIL renders outline fallback only,
+#       which loses all the colour/texture effect (e.g. Wavemermaid grey outlines).
+# Only checked for PREMIUM_FONT_KEYS so standard/system fonts are not affected.
 SVG_ONLY_FONT_KEYS = set()
+
 def _test_font_renders(path):
     """Return True if this font file produces visible pixels when rendering 'A'."""
     try:
@@ -770,12 +801,65 @@ def _test_font_renders(path):
     except Exception:
         return False  # can't load at all → also needs Chrome
 
+def _has_colour_table(path):
+    """Return True if the font has SVG/COLR/sbix colour glyph tables."""
+    try:
+        from fontTools.ttLib import TTFont as _TT
+        _tt = _TT(path, lazy=True)
+        return any(t in _tt for t in ('SVG ', 'COLR', 'sbix'))
+    except Exception:
+        return False
+
+def _auto_tracking_from_font(path):
+    """Compute tracking multiplier from font glyph fill ratios for A-Z / a-z.
+    fill_ratio = mean(glyph_bbox_width / advance_width).
+    tracking   = 1 − (1 − fill_ratio) × 0.5  (removes half the built-in sidebearing).
+    Returns 1.0 on any error."""
+    try:
+        from fontTools.ttLib import TTFont as _TT
+        _ft   = _TT(path, lazy=True)
+        _hmtx = _ft['hmtx'].metrics
+        _cmap = _ft.getBestCmap()
+        _glyf = _ft.get('glyf')
+        _ratios = []
+        for _cp in list(range(ord('A'), ord('Z') + 1)) + list(range(ord('a'), ord('z') + 1)):
+            _gname = _cmap.get(_cp) if _cmap else None
+            if not _gname:
+                continue
+            _adv, _lsb = _hmtx.get(_gname, (0, 0))
+            if _adv <= 0:
+                continue
+            _w = None
+            if _glyf:
+                try:
+                    _g = _glyf[_gname]
+                    if hasattr(_g, 'xMax') and _g.xMax is not None:
+                        _w = _g.xMax - _g.xMin
+                except Exception:
+                    pass
+            if _w is None or _w <= 0:
+                _w = _adv - 2 * max(0, _lsb)   # proxy: assume symmetric sidebearings
+            if _w > 0:
+                _ratios.append(min(1.0, _w / _adv))
+        if not _ratios:
+            return 1.0
+        _fill = max(0.50, min(1.0, sum(_ratios) / len(_ratios)))
+        return round(1.0 - (1.0 - _fill) * 0.5, 3)
+    except Exception:
+        return 1.0
+
 for _key, _path in FONT_INDEX.items():
-    if not _test_font_renders(_path):
-        SVG_ONLY_FONT_KEYS.add(_key)
+    if _key in PREMIUM_FONT_KEYS:
+        if not _test_font_renders(_path) or _has_colour_table(_path):
+            SVG_ONLY_FONT_KEYS.add(_key)
 
 if SVG_ONLY_FONT_KEYS:
     print(f"  SVG colour fonts (Chrome renderer): {sorted(SVG_ONLY_FONT_KEYS)}")
+
+if SVG_ONLY_FONT_KEYS:
+    for _k in sorted(SVG_ONLY_FONT_KEYS):
+        _t = FONT_TRACKING.get(_k, 1.0)
+        print(f"  Font tracking: {_t}  ({_k})")
 
 def _is_premium_font_name(font_name):
     """Return True if this font is a premium colour font (all go through Chrome)."""
@@ -863,12 +947,15 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
         # scale-to-canvas step — prevents blurring on upscale.
         glyph_h   = max(800, min(2400, target_w * 4))
 
-        # vb_h_render: viewBox height used when rendering each glyph.
-        # Must span from top of ascenders (-ascender) down to below baseline.
-        # 1.6× headroom above the ascender prevents 3D decorative tops from
-        # being cropped (Block Font, Cozy, Mermaid lego-style caps).
-        vb_h_render = int(ascender * 2.85)
-        scale       = glyph_h / vb_h_render   # font units → screen pixels
+        # Square viewBox: "0 -850 1000 1000" — same width and height (1000 units).
+        # vb_top=-850 captures the full cap height (700u) + 150u buffer above.
+        # The viewBox bottom is at y=+150, covering descenders.
+        # Square viewBox + square element = x_scale == y_scale == glyph_h/1000,
+        # so glyph proportions are preserved exactly (no distortion).
+        # scale = adv_px factor; sf = composition advance factor — both glyph_h/1000.
+        vb_top      = -850
+        vb_h_render = 1000  # square viewBox (== upem)
+        scale       = glyph_h / upem            # glyph_h / 1000
 
         # ── Collect unique characters and prepare their SVG ──────────────────
         all_chars = sorted(set(ch for l in text_lines for ch in l if ch.strip()))
@@ -898,7 +985,6 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
             # designer laid out the SVG coordinate space per glyph.
             # The viewBox spans the full advance width horizontally and the
             # standard cap-height range vertically.
-            vb_top  = int(-ascender * 1.6)    # 60% extra headroom above ascender
             vb_attr = f'viewBox="0 {vb_top} {upem} {vb_h_render}"'
             if 'viewBox' in svg:
                 svg = re.sub(r'viewBox="[^"]*"', vb_attr, svg)
@@ -907,9 +993,16 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
             # Pixel dimensions: width scales with advance, height = glyph_h.
             # Both are derived from the SAME scale factor so all glyphs have
             # identical height and proportional widths.
+            # Square element (h_px × h_px) + square viewBox (1000 × 1000):
+            # x_scale = y_scale = h_px/1000, so glyph proportions are exact.
+            # Default "xMidYMid meet" has no letterboxing effect on a
+            # square-on-square layout — content fills the full element.
+            # The advance-width crop (x=0..adv_px) is taken from the left
+            # side of the square element in the crop step below.
+            svg = re.sub(r'\s+preserveAspectRatio="[^"]*"', '', svg)
             svg = re.sub(r'\s+width="[^"]*"',  '', svg)
             svg = re.sub(r'\s+height="[^"]*"', '', svg)
-            svg = svg.replace('<svg', f'<svg width="{adv_px}px" height="{h_px}px"', 1)
+            svg = svg.replace('<svg', f'<svg width="{h_px}px" height="{h_px}px"', 1)
             # Shared document: inject CSS to show only this glyph's <g> element
             if shared:
                 hide = (f'<style>g{{display:none}}'
@@ -927,17 +1020,25 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
         # These are rendered in a separate Chrome pass AFTER cap_h is known
         # so they can be sized to match the premium font letter height exactly.
         _VARIATION_SELECTORS = set(range(0xFE00, 0xFE10)) | {0xFE0F}
-        emoji_fallback = set()   # chars not in premium font cmap
+        emoji_fallback = set()   # chars not in cmap at all → Chrome emoji pass
+        outline_only   = set()   # chars in cmap but no SVG colour entry → PIL + colour
         for _line in text_lines:
             for _ch in _line:
                 _cp = ord(_ch)
                 if not _ch.strip() or _cp in _VARIATION_SELECTORS:
                     continue
                 if _ch not in char_svg:
-                    emoji_fallback.add(_ch)
+                    if cmap.get(_cp):
+                        outline_only.add(_ch)   # outline glyph exists, just no colour table
+                    else:
+                        emoji_fallback.add(_ch)
 
         # ── Build one-line collage HTML (premium font glyphs only) ───────────
-        collage_w = sum(v[0] for v in char_svg.values()) + 10
+        # Each glyph element is h_px × h_px (square) so Chrome renders it
+        # without distortion.  x_pos tracks the LEFT edge of each element;
+        # the crop step below takes only the advance-width slice (0..adv_px)
+        # from the left side of the square element.
+        collage_w = sum(v[1] for v in char_svg.values()) + 10  # v[1]=h_px (square width)
         collage_h = max((v[1] for v in char_svg.values()), default=glyph_h) + 10
 
         items_html = ""
@@ -947,11 +1048,11 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
             svg_b64 = _b64.b64encode(svg_str.encode("utf-8")).decode("ascii")
             items_html += (
                 f'<img style="position:absolute;left:{cx}px;top:0;'
-                f'width:{adv_px}px;height:{h_px}px;display:block" '
+                f'width:{h_px}px;height:{h_px}px;display:block" '  # square element
                 f'src="data:image/svg+xml;base64,{svg_b64}">\n'
             )
             x_pos[ch] = cx
-            cx += adv_px
+            cx += h_px  # advance by element width (= glyph_h), not adv_px
 
         html_src = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>
@@ -997,8 +1098,23 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
         # Handle HiDPI: Chrome may return 2× pixels
         dpr = collage_img.width / collage_w if collage_w > 0 else 1.0
 
-        # ── Crop individual glyphs from collage ───────────────────────────────
+        # ── Baseline position in the rendered collage ────────────────────────
+        # vb_top = -850: baseline (y=0) sits 850 units from top of the
+        # 1200-unit window → baseline_y_px = (850/1200) * glyph_h ≈ 0.708·h
+        _vb_top_abs   = 850
+        baseline_y_px = int(_vb_top_abs / vb_h_render * glyph_h)
+        # sf strictly from the 1000-unit Em Square (same as scale)
+        sf = glyph_h / upem
+
+        # ── Crop individual glyphs from collage, record per-glyph baseline offsets ─
+        # Horizontal: keep the FULL advance-width slice — do NOT tight-crop sides.
+        # The transparent sidebearing space in the image IS the inter-letter gap;
+        # removing it would eliminate the font's designed spacing and cause letters
+        # to touch or overlap when composed.
+        # Vertical: tight-crop to the visible rows only (removes blank top/bottom).
         glyph_imgs_raw = {}
+        glyph_above_bl = {}
+        glyph_below_bl = {}
         for ch, (adv_px, h_px, _) in char_svg.items():
             x0 = int(x_pos[ch] * dpr)
             x1 = int((x_pos[ch] + adv_px) * dpr)
@@ -1011,37 +1127,88 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
             white = (arr[:, :, 0] > 240) & (arr[:, :, 1] > 240) & (arr[:, :, 2] > 240)
             arr[white, 3] = 0
             img_rgba = Image.fromarray(arr)
-            bbox = img_rgba.getbbox()
-            # Crop to visible content bbox so we know the real pixel size
-            glyph_imgs_raw[ch] = img_rgba.crop(bbox) if (bbox and arr[:, :, 3].max() > 0) else None
+            if arr[:, :, 3].max() > 0:
+                # Vertical tight-crop: find first and last rows with visible pixels
+                _row_alpha = arr[:, :, 3].max(axis=1)
+                _vis = np.where(_row_alpha > 0)[0]
+                if len(_vis) > 0:
+                    _yt = int(_vis[0]);  _yb = int(_vis[-1]) + 1
+                    glyph_imgs_raw[ch] = img_rgba.crop((0, _yt, img_rgba.width, _yb))
+                    glyph_above_bl[ch] = _yb - _yt   # visible height (for bottom-align)
+                    glyph_below_bl[ch] = 0
+                else:
+                    glyph_imgs_raw[ch] = None
+                    glyph_above_bl[ch] = 0
+                    glyph_below_bl[ch] = 0
+            else:
+                glyph_imgs_raw[ch] = None
+                glyph_above_bl[ch] = 0
+                glyph_below_bl[ch] = 0
 
         if not any(v is not None for v in glyph_imgs_raw.values()):
             log(f"  Collage render: all glyphs transparent for {font_name}", "WARN")
             return None
 
-        # Normalise glyphs within each typographic class to a uniform height.
-        # Uppercase + digits  → cap_h  (normalise all to the tallest uppercase glyph)
-        # Lowercase           → x_h    (normalise all to the tallest lowercase glyph)
-        # Punctuation/symbols → keep natural size (never scale up a tiny apostrophe)
-        # This preserves the visual uppercase/lowercase distinction.
-        import string as _string
-        _UPPER      = set(_string.ascii_uppercase + _string.digits)
-        _LOWER      = set(_string.ascii_lowercase)
-        _SMALL_PUNCT = set(".,;:'\"\\-")
-        _upper_hs = [g.height for ch, g in glyph_imgs_raw.items() if g is not None and ch in _UPPER]
-        _lower_hs = [g.height for ch, g in glyph_imgs_raw.items() if g is not None and ch in _LOWER]
-        cap_h = max(_upper_hs, default=None)
-        x_h   = max(_lower_hs, default=None)
-        if cap_h is None: cap_h = x_h or 1
-        if x_h   is None: x_h   = cap_h
-        max_content_h = cap_h   # line_h is always driven by cap height
+        # Line metrics driven purely by the rendered glyphs.
+        # With preserveAspectRatio="none" every glyph renders at its true
+        # proportional size — caps are tall, period is small — so no manual
+        # normalisation is needed.  above_bl / below_bl are baseline-relative
+        # pixel offsets computed directly from the crop's alpha bounding box.
+        max_above = max((v for v in glyph_above_bl.values() if v > 0),
+                        default=int(glyph_h * 0.625))
+        max_below = max((v for v in glyph_below_bl.values() if v > 0),
+                        default=int(glyph_h * 0.1))
+        line_h    = max_above + max_below
 
-        # ── Render emoji at cap_h size (separate Chrome pass) ─────────────────
-        # Segoe UI Emoji glyphs occupy roughly 80% of font-size; set font-size
-        # to cap_h/0.8 so the colored pixels fill approximately cap_h pixels.
+        # ── Render outline-only glyphs via PIL with customer colour ───────────
+        # Characters like " " ' that are in the cmap (have outline glyphs) but
+        # have no SVG colour entry.  Render them at cap-height size in the
+        # customer's chosen colour so they match the overall text scheme.
+        if outline_only:
+            try:
+                from PIL import ImageFont as _PIF, Image as _PImg, ImageDraw as _PID
+                _cx = colour_hex or "#ffffff"
+                _r  = int(_cx[1:3], 16) if len(_cx) >= 7 else 255
+                _g  = int(_cx[3:5], 16) if len(_cx) >= 7 else 255
+                _bv = int(_cx[5:7], 16) if len(_cx) >= 7 else 255
+                _pil_sz = max(50, max_above)
+                _pil_f  = None
+                for _fp in [font_path, None]:
+                    try:
+                        _pil_f = _PIF.truetype(_fp, _pil_sz) if _fp else _PIF.load_default()
+                        break
+                    except Exception:
+                        continue
+                if _pil_f:
+                    for _ch in outline_only:
+                        _gn = cmap.get(ord(_ch))
+                        _adv_u = hmtx.get(_gn, (upem // 3, 0))[0] if _gn else upem // 3
+                        _adv_px = max(1, int(_adv_u * sf * _tracking))
+                        _tmp = _PImg.new("RGBA", (max(100, _adv_px * 3), max(100, _pil_sz * 2)), (0, 0, 0, 0))
+                        _PID.Draw(_tmp).text((0, 0), _ch, font=_pil_f, fill=(_r, _g, _bv, 255))
+                        _bb = _tmp.getbbox()
+                        if _bb:
+                            _crop = _tmp.crop(_bb)
+                            glyph_imgs_raw[_ch] = _crop
+                            glyph_above_bl[_ch] = _crop.height
+                            glyph_below_bl[_ch] = 0
+                            char_svg[_ch] = (_adv_px, _pil_sz, None)
+            except Exception:
+                pass
+
+        # Top-punctuation fix: apostrophes and quotes sit above the baseline
+        # (near cap height), not at it.  Setting above_bl = max_above forces
+        # gy = 0 so they paste at the very top of the line, matching their
+        # visual position relative to capital letters.
+        _TOP_PUNCT = set("'‘’\"“”`´ʼʻ'＇")
+        for _ch in list(glyph_above_bl):
+            if _ch in _TOP_PUNCT and glyph_imgs_raw.get(_ch) is not None:
+                glyph_above_bl[_ch] = max_above
+
+        # ── Render emoji at cap-height size (separate Chrome pass) ────────────
         if emoji_fallback:
-            em_font_px = max(20, int(cap_h / 0.80))
-            em_div_px  = int(em_font_px * 2.0)   # generous height so bottom of emoji isn't clipped
+            em_font_px = max(20, int(max_above / 0.80))
+            em_div_px  = int(em_font_px * 2.0)
             em_cols    = {}
             em_items   = ""
             em_cx      = 0
@@ -1056,7 +1223,6 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
                 )
                 em_cols[_ch] = em_cx
                 em_cx += em_div_px
-
             em_w = em_cx + 5
             em_h = em_div_px + 5
             em_html = (
@@ -1104,92 +1270,53 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
                         _arr[_white, 3] = 0
                         _rgba = Image.fromarray(_arr)
                         _bbox = _rgba.getbbox()
-                        glyph_imgs_raw[_ch] = _rgba.crop(_bbox) if (_bbox and _arr[:, :, 3].max() > 0) else None
+                        if _bbox and _arr[:, :, 3].max() > 0:
+                            glyph_imgs_raw[_ch] = _rgba.crop(_bbox)
+                            glyph_above_bl[_ch] = max_above
+                            glyph_below_bl[_ch] = max(0, _rgba.crop(_bbox).height - max_above)
+                        else:
+                            glyph_imgs_raw[_ch] = None
+                            glyph_above_bl[_ch] = 0
+                            glyph_below_bl[_ch] = 0
                 except Exception:
                     pass
 
-        glyph_imgs    = {}
-        glyph_base_y  = {}      # per-char vertical offset when pasting into line_img
-        for ch, gimg in glyph_imgs_raw.items():
-            if gimg is None:
-                glyph_imgs[ch] = None
-                continue
-            if ch in _UPPER:
-                target_h = cap_h
-                base_y   = 0                        # sit at top of line
-            elif ch in _LOWER:
-                target_h = x_h
-                base_y   = cap_h - x_h             # baseline-align (sit at bottom)
-            else:
-                if ch in _SMALL_PUNCT:
-                    # Small punctuation: render at ~45% of cap height, sit at baseline
-                    target_h = max(1, int(cap_h * 0.45))
-                    base_y   = cap_h - target_h
-                elif ch in emoji_fallback:
-                    # Emoji: scale to cap height, vertically centred
-                    target_h = cap_h
-                    base_y   = 0
-                elif ch in char_svg:
-                    # Font has a full display glyph for this symbol → scale to cap_h
-                    target_h = cap_h
-                    base_y   = 0
-                else:
-                    target_h = gimg.height
-                    base_y   = max(0, (cap_h - gimg.height) // 2)  # vertically centred
-            if gimg.height != target_h:
-                sf   = target_h / gimg.height
-                nw   = max(1, int(gimg.width * sf))
-                gimg = gimg.resize((nw, target_h), Image.LANCZOS)
-            glyph_imgs[ch]   = gimg
-            glyph_base_y[ch] = base_y
-
-        # ── Compose text lines ────────────────────────────────────────────────
-        # Advance width = max(hmtx advance, actual content width + small gap).
-        # Using hmtx alone causes overlaps when short glyphs are normalised up
-        # to max_content_h (width scales up too, exceeding the advance cell).
-        norm_scale = max_content_h / max(1, glyph_h)
-        space_em   = hmtx.get('space', hmtx.get('uni0020', (upem // 3, 0)))[0]
-        space_w    = max(4, int(space_em * norm_scale * glyph_h / upem))
-        min_gap    = max(4, max_content_h // 20)   # ~5% of cap height between letters
-        line_h     = max_content_h
-        line_imgs  = []
+        # ── Compose text lines — uniform sf, hmtx advance, baseline-anchored ─
+        # X advance = hmtx_advance × sf × tracking  (single scale, per-font tracking)
+        # Y paste   = max_above - above_bl[ch]  (aligns all baselines to one row)
+        # Period uses identical sf as every other glyph — no independent shrinking.
+        _tracking = FONT_TRACKING.get(key, 1.0)
+        space_em  = hmtx.get('space', hmtx.get('uni0020', (upem // 3, 0)))[0]
+        space_w   = max(4, int(space_em * sf * _tracking))
+        line_imgs = []
         for line_text in text_lines:
             if not line_text.strip():
                 line_imgs.append(None)
                 continue
-            x = 0
+            x     = 0
             parts = []
             for ch in line_text:
-                gimg = glyph_imgs.get(ch)
+                gimg = glyph_imgs_raw.get(ch)
                 if ch in char_svg:
-                    adv_px_at_glyph_h = char_svg[ch][0]
-                    adv_hmtx = max(1, int(adv_px_at_glyph_h * norm_scale))
-                    content_w = gimg.width if gimg is not None else 0
-                    if ch in _SMALL_PUNCT:
-                        # Use actual content width — ignore the font's large hmtx advance
-                        adv = content_w + min_gap
-                    else:
-                        # Never let advance be smaller than the glyph content —
-                        # that would cause letters to overlap each other.
-                        adv = max(adv_hmtx, content_w + min_gap)
-                    gx_offset = max(0, (adv - content_w) // 2)
+                    gname = cmap.get(ord(ch))
+                    adv_u = hmtx.get(gname, (upem // 3, 0))[0] if gname else upem // 3
+                    adv   = max(1, int(adv_u * sf * _tracking))
+                    parts.append((gimg, x, glyph_above_bl.get(ch, max_above)))
+                    x += adv
                 elif ch in emoji_fallback:
-                    content_w = gimg.width if gimg is not None else 0
-                    adv = content_w + min_gap
-                    gx_offset = 0
+                    adv = max(1, int((gimg.width + 4) * _tracking)) if gimg is not None else space_w
+                    parts.append((gimg, x, glyph_above_bl.get(ch, max_above)))
+                    x += adv
                 else:
-                    adv = space_w
-                    gx_offset = 0
-                parts.append((ch, gimg, x + gx_offset))
-                x += adv
+                    x += space_w
             if x <= 0:
                 line_imgs.append(None)
                 continue
             line_img = Image.new("RGBA", (x, line_h), (0, 0, 0, 0))
-            for ch, gimg, gx in parts:
+            for gimg, gx, above in parts:
                 if gimg is not None:
-                    gy = glyph_base_y.get(ch, 0)
-                    line_img.paste(gimg, (gx, gy), gimg)
+                    gy = max_above - above   # baseline-anchor: align to common baseline row
+                    line_img.paste(gimg, (gx, max(0, gy)), gimg)
             line_imgs.append(line_img)
 
         valid = [li for li in line_imgs if li is not None]
@@ -1538,6 +1665,15 @@ def build_text_layer(text_lines, font_name, colour_hex, w, h):
         chrome_col = None if _is_svg_only_font(font_name) else colour_hex
         chrome_img = build_text_layer_chrome(text_lines, font_name, chrome_col, w)
         if chrome_img is not None:
+            # Scale to fill canvas width (85 % margin) — same target the PIL
+            # binary-search path uses.  Chrome renders at glyph_h resolution so
+            # upscaling here stays sharp.
+            avail_w = int(w * 0.85)
+            if chrome_img.width > 0 and chrome_img.width != avail_w:
+                _s = avail_w / chrome_img.width
+                chrome_img = chrome_img.resize(
+                    (avail_w, max(1, int(chrome_img.height * _s))),
+                    Image.LANCZOS)
             left = max(0, (w - chrome_img.width) // 2)
             return chrome_img, 0, left
         # Chrome failed (no SVG table) → fall through to PIL
@@ -1549,34 +1685,37 @@ def build_text_layer(text_lines, font_name, colour_hex, w, h):
     if not real_lines:
         return Image.new("RGBA", (1, 1), (0, 0, 0, 0)), 0, 0
 
-    # ── Resolve font path and load fontTools metrics ─────────────────────────
-    font_path   = FONT_INDEX.get(font_name.lower().replace(" ", ""))
-    ft_hmtx     = None
-    ft_cmap     = None
-    ft_upem     = None
-    ft_glyph_order = None
+    # Per-font tracking multiplier (same map used by Chrome SVG renderer)
+    _font_key = _resolve_font_key(font_name) or ""
+    _tracking  = FONT_TRACKING.get(_font_key, 1.0)
+
+    # ── Load fontTools metrics (head + hmtx) ─────────────────────────────────
+    font_path = FONT_INDEX.get(font_name.lower().replace(" ", ""))
+    ft_hmtx   = None
+    ft_cmap   = None
+    ft_upem   = None
     if font_path:
         try:
             from fontTools.ttLib import TTFont as _TTFont
-            _ft = _TTFont(font_path)
-            ft_upem        = _ft['head'].unitsPerEm
-            ft_hmtx        = _ft['hmtx'].metrics
-            ft_cmap        = _ft.getBestCmap()
-            ft_glyph_order = _ft.getGlyphOrder()
+            _ft    = _TTFont(font_path)
+            ft_upem = _ft['head'].unitsPerEm          # unitsPerEm from head table
+            ft_hmtx = _ft['hmtx'].metrics             # glyph_name → (advance, lsb)
+            ft_cmap = _ft.getBestCmap()               # codepoint → glyph_name
         except Exception:
-            ft_hmtx = ft_cmap = ft_upem = ft_glyph_order = None
+            ft_hmtx = ft_cmap = ft_upem = None
 
     def _line_width_px(line, font_size):
-        """Measure line width using hmtx advance widths when available,
-        falling back to Pillow textbbox for fonts without fontTools data."""
+        """Width = Σ advance_width × (font_size / unitsPerEm) × tracking.
+        Never uses textbbox() or getmask() — purely metric-based."""
         if ft_hmtx and ft_cmap and ft_upem:
-            scale  = font_size / ft_upem
-            total  = 0
+            sf    = font_size / ft_upem * _tracking
+            total = 0
             for ch in line:
                 gname = ft_cmap.get(ord(ch))
                 adv   = ft_hmtx.get(gname, (ft_upem // 3, 0))[0] if gname else ft_upem // 3
-                total += int(adv * scale)
+                total += int(adv * sf)
             return total
+        # Fallback only when fontTools is unavailable (textbbox for sizing, not X-advance)
         scratch = Image.new("RGBA", (1, 1))
         bb = ImageDraw.Draw(scratch).textbbox((0, 0), line, font=get_font(font_name, font_size))
         return bb[2] - bb[0]
@@ -1592,52 +1731,57 @@ def build_text_layer(text_lines, font_name, colour_hex, w, h):
         else:
             hi   = mid - 1
 
-    font          = get_font(font_name, best)
-    scale_factor  = (best / ft_upem) if ft_upem else None
-    scratch       = Image.new("RGBA", (1, 1))
-    bb0           = ImageDraw.Draw(scratch).textbbox((0, 0), real_lines[0], font=font)
-    line_h        = int((bb0[3] - bb0[1]) * 1.4)
-    pad           = line_h
+    font         = get_font(font_name, best)
+    # scale_factor = font_size / unitsPerEm  (per user spec)
+    scale_factor = (best / ft_upem) if ft_upem else None
+
+    # Line height from textbbox — height measurement only, not used for X positioning
+    scratch = Image.new("RGBA", (1, 1))
+    bb0     = ImageDraw.Draw(scratch).textbbox((0, 0), real_lines[0], font=font)
+    line_h  = int((bb0[3] - bb0[1]) * 1.4)
+    pad     = line_h
 
     tmp_w = w + pad * 2
     tmp_h = line_h * len(text_lines) + pad * 2
     img   = Image.new("RGBA", (tmp_w, tmp_h), (0, 0, 0, 0))
     d2    = ImageDraw.Draw(img)
-    # Baseline y: top-of-line pad + ascent portion of line_h
-    baseline_y = pad + int(line_h * 0.75)
+    baseline_y = pad + int(line_h * 0.75)   # anchor='ls' baseline row
 
     has_emoji = any(ord(c) > 127 for line in text_lines for c in line)
 
     for line in text_lines:
         if line.strip():
-            if ft_hmtx and ft_cmap and ft_upem and scale_factor and not has_emoji:
-                # ── hmtx-driven character placement ──────────────────────
-                # Measure total line width via advance widths for centering
+            if ft_hmtx and ft_cmap and ft_upem and scale_factor:
+                # ── Metric-based cursor positioning ───────────────────────────
+                # advance_width × scale_factor × tracking — no textbbox/getmask
+                # for X advance. Period stays its natural size; 'W' stays wide.
                 line_px = sum(
-                    int(ft_hmtx.get(ft_cmap.get(ord(ch)), (ft_upem // 3, 0))[0] * scale_factor)
+                    int(ft_hmtx.get(ft_cmap.get(ord(ch)), (ft_upem // 3, 0))[0]
+                        * scale_factor * _tracking)
                     for ch in line
                 )
-                x = max(pad, pad + (w - line_px) // 2)
+                current_x = max(pad, pad + (w - line_px) // 2)
                 for ch in line:
-                    gname   = ft_cmap.get(ord(ch))
-                    adv_u   = ft_hmtx.get(gname, (ft_upem // 3, 0))[0] if gname else ft_upem // 3
-                    adv_px  = int(adv_u * scale_factor)
-                    # anchor='ls': x is left edge of advance cell, y is baseline
-                    d2.text((x, baseline_y), ch, font=font, fill=(r, g, b, 255), anchor='ls')
-                    x += adv_px
+                    gname = ft_cmap.get(ord(ch))
+                    adv_u = ft_hmtx.get(gname, (ft_upem // 3, 0))[0] if gname else ft_upem // 3
+                    # anchor='ls': current_x = left of advance cell, baseline_y = baseline
+                    d2.text((current_x, baseline_y), ch, font=font,
+                            fill=(r, g, b, 255), anchor='ls')
+                    current_x += int(adv_u * scale_factor * _tracking)
             else:
-                # ── Pillow fallback (emoji or no fontTools data) ──────────
+                # Emoji fallback or no fontTools — textbbox for line centering only
                 if has_emoji and PILMOJI_AVAILABLE:
-                    bb  = ImageDraw.Draw(Image.new("RGBA", (1, 1))).textbbox((0, 0), line, font=font)
-                    lw  = bb[2] - bb[0]
-                    x   = max(pad, pad + (w - lw) // 2)
+                    bb = ImageDraw.Draw(Image.new("RGBA", (1, 1))).textbbox(
+                        (0, 0), line, font=font)
+                    x = max(pad, pad + (w - (bb[2] - bb[0])) // 2)
                     with Pilmoji(img) as pil:
-                        pil.text((x, baseline_y - int(line_h * 0.75)), line, fill=(r, g, b, 255), font=font)
+                        pil.text((x, baseline_y - int(line_h * 0.75)),
+                                 line, fill=(r, g, b, 255), font=font)
                 else:
-                    bb  = d2.textbbox((0, 0), line, font=font)
-                    lw  = bb[2] - bb[0]
-                    x   = max(pad, pad + (w - lw) // 2)
-                    d2.text((x, baseline_y), line, font=font, fill=(r, g, b, 255), anchor='ls')
+                    bb = d2.textbbox((0, 0), line, font=font)
+                    x  = max(pad, pad + (w - (bb[2] - bb[0])) // 2)
+                    d2.text((x, baseline_y), line, font=font,
+                            fill=(r, g, b, 255), anchor='ls')
         baseline_y += line_h
 
     bbox = img.getbbox()
@@ -2383,7 +2527,7 @@ def build_merged_psd_for_order_group(order_id, rows, out_path, no_bg_remove=Fals
 def get_db():
     return pyodbc.connect(DB_CONNECTION)
 
-def fetch_orders(limit=None, order_id_filter=None, sku_filter=None, multizone=False, reprocess=False, date_filter=None, date_after=None):
+def fetch_orders(limit=None, order_id_filter=None, sku_filter=None, multizone=False, reprocess=False, date_filter=None, date_after=None, font_filter=None):
     conn  = get_db()
     cur   = conn.cursor()
     if reprocess:
@@ -2415,6 +2559,13 @@ def fetch_orders(limit=None, order_id_filter=None, sku_filter=None, multizone=Fa
         where += f" AND CAST(o.DateAdd AS DATE) = '{date_filter}'"
     if date_after:
         where += f" AND CAST(o.DateAdd AS DATE) > '{date_after}'"
+    if font_filter:
+        fonts = [f.strip() for f in font_filter.split(",") if f.strip()]
+        like_parts = []
+        for f in fonts:
+            like_parts.append(f"d.FrontFonts LIKE '%{f}%'")
+            like_parts.append(f"d.BackFonts LIKE '%{f}%'")
+        where += f" AND ({' OR '.join(like_parts)})"
     top = f"TOP {limit}" if limit else ""
     # Check whether the premium font columns exist (live DB has them, local may not)
     try:
@@ -2557,7 +2708,7 @@ def gdrive_upload_psd(local_path, date_str, folder_type, colour_sub):
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
-def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, multizone=False, reprocess=False, date_filter=None, date_after=None, upload_gdrive=False, no_bg_remove=False):
+def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, multizone=False, reprocess=False, date_filter=None, date_after=None, upload_gdrive=False, no_bg_remove=False, output_folder=None, font_filter=None):
     log("=" * 60)
     log(f"Varsany Batch Processor  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log(f"Resolution : {PX_PER_CM} px/cm  ({DPI} DPI)")
@@ -2569,7 +2720,7 @@ def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, 
 
     orders = fetch_orders(limit=limit, order_id_filter=order_id_filter,
                           sku_filter=sku_filter, multizone=multizone, reprocess=reprocess,
-                          date_filter=date_filter, date_after=date_after)
+                          date_filter=date_filter, date_after=date_after, font_filter=font_filter)
     total  = len(orders)
     log(f"Orders to process: {total}")
 
@@ -2580,7 +2731,7 @@ def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, 
     ok_count   = 0
     fail_count = 0
     today      = datetime.now().strftime("%Y-%m-%d")
-    out_dir    = os.path.join(OUTPUT_FOLDER, today)
+    out_dir    = output_folder if output_folder else os.path.join(OUTPUT_FOLDER, today)
     os.makedirs(out_dir, exist_ok=True)
 
     # Group rows by OrderID — one PSD per order (may contain multiple SKUs)
@@ -2689,6 +2840,8 @@ if __name__ == "__main__":
     parser.add_argument("--date-after",  type=str, default=None, help="Export orders placed after a date e.g. 2026-04-10")
     parser.add_argument("--gdrive",        action="store_true",    help="Upload finished PSDs to Google Drive after export")
     parser.add_argument("--no-bg-remove",  action="store_true",    help="Skip background removal for all zones")
+    parser.add_argument("--output",        type=str, default=None, help="Override output folder e.g. C:\\Varsany\\Output\\test1")
+    parser.add_argument("--font-filter",   type=str, default=None, help="Comma-separated font name substrings e.g. 'Mermaid Font,Block Font'")
     args = parser.parse_args()
 
     PX_PER_CM = args.dpi
@@ -2705,4 +2858,6 @@ if __name__ == "__main__":
         date_after     = args.date_after,
         upload_gdrive  = args.gdrive,
         no_bg_remove   = args.no_bg_remove,
+        output_folder  = args.output,
+        font_filter    = args.font_filter,
     )
