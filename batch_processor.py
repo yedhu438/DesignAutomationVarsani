@@ -27,6 +27,14 @@ try:
 except ImportError:
     REMBG_AVAILABLE = False
 
+try:
+    from esrgan_helper import enhance_pil as _esrgan_enhance
+    _ESRGAN_AVAILABLE = True
+except Exception:
+    _ESRGAN_AVAILABLE = False
+
+_ESRGAN_MIN_RATIO = 1.5   # only use AI upscale when enlarging >= 1.5x
+
 # Editable text layer writer (TySh + Txt2 PSD blocks)
 try:
     from psd_text_layer import build_editable_text_tagged_blocks, resolve_ps_font_name
@@ -710,11 +718,21 @@ def build_image_layer(img_path, w, h, sku=None):
     if bbox:
         src = src.crop(bbox)
 
-    # Scale to full zone width — height follows proportionally
+    # Scale to full zone width — height follows proportionally.
+    # Use Real-ESRGAN for large upscales (ratio >= 1.5x) for sharper output.
     ratio = w / src.width
     nw    = w
     nh    = max(1, int(src.height * ratio))
-    src   = src.resize((nw, nh), Image.LANCZOS)
+    if _ESRGAN_AVAILABLE and ratio >= _ESRGAN_MIN_RATIO:
+        try:
+            src = _esrgan_enhance(src, scale=4)
+        except Exception as _e:
+            log(f"  ESRGAN failed ({_e}), falling back to LANCZOS", "WARN")
+        # Snap to exact target after ESRGAN (may overshoot)
+        if src.width != nw or src.height != nh:
+            src = src.resize((nw, nh), Image.LANCZOS)
+    else:
+        src = src.resize((nw, nh), Image.LANCZOS)
     return src, 0, 0
 
 try:

@@ -738,24 +738,27 @@ def write_psd(out_path, canvas_w, canvas_h, layers):
 
 # ─── AI UPSCALER (Real-ESRGAN) ────────────────────────────────────────────────
 
+try:
+    from esrgan_helper import enhance_pil as _esrgan_enhance
+    _ESRGAN_AVAILABLE = True
+except Exception:
+    _ESRGAN_AVAILABLE = False
 
-_ESRGAN_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'esrgan_helper.py')
-_ESRGAN_MODEL  = r'C:\Varsany\realesrgan\RealESRGAN_x4plus.pth'
+# Minimum upscale ratio to justify running the AI model.
+# Below this threshold plain LANCZOS is fast and indistinguishable.
+_ESRGAN_MIN_RATIO = 1.5
+
 
 def _sharpen(img_pil):
-    """Apply unsharp mask + sharpness boost for crisp DTF output."""
     from PIL import ImageFilter, ImageEnhance
     mode = img_pil.mode
-    # Work on RGB(A) — split alpha to avoid sharpening transparent edges
     if mode == 'RGBA':
         r, g, b, a = img_pil.split()
         rgb = Image.merge('RGB', (r, g, b))
     else:
         rgb = img_pil.convert('RGB')
         a = None
-    # Unsharp mask: radius=1.5, percent=160, threshold=3
     rgb = rgb.filter(ImageFilter.UnsharpMask(radius=1.5, percent=160, threshold=3))
-    # Additional sharpness enhancer (1.0 = original, 2.0 = double)
     rgb = ImageEnhance.Sharpness(rgb).enhance(1.4)
     if a is not None:
         r, g, b = rgb.split()
@@ -764,13 +767,30 @@ def _sharpen(img_pil):
 
 
 def upscale_image(img_pil, target_w, target_h):
-    """Upscale to at least target size using LANCZOS + sharpening."""
+    """
+    Upscale to at least (target_w, target_h).
+    Uses Real-ESRGAN (4x) when ratio >= 1.5, then LANCZOS to exact target.
+    Falls back to plain LANCZOS if realesrgan is not installed.
+    """
     src_w, src_h = img_pil.size
     ratio = max(target_w / src_w, target_h / src_h)
-    if ratio > 1.0:
-        nw = max(1, int(src_w * ratio))
-        nh = max(1, int(src_h * ratio))
+    if ratio <= 1.0:
+        return _sharpen(img_pil)
+
+    if _ESRGAN_AVAILABLE and ratio >= _ESRGAN_MIN_RATIO:
+        try:
+            img_pil = _esrgan_enhance(img_pil, scale=4)
+        except Exception as _e:
+            log(f'[ESRGAN] failed ({_e}), falling back to LANCZOS', 'WARN')
+
+    # Final resize to exact target (ESRGAN may overshoot, or LANCZOS was used)
+    cur_w, cur_h = img_pil.size
+    need = max(target_w / cur_w, target_h / cur_h)
+    if need > 1.0:
+        nw = max(1, int(cur_w * need))
+        nh = max(1, int(cur_h * need))
         img_pil = img_pil.resize((nw, nh), Image.LANCZOS)
+
     return _sharpen(img_pil)
 
 
