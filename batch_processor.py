@@ -209,8 +209,12 @@ FONT_TRACKING = {
     # Chrome pixel measurement A-Z: mean fill=0.655, min-safe=0.680 (S→T pair).
     # T=0.68 → letters nearly touching; T=1.0 → ~200px visible gap per letter.
     "refractionray": 0.68,
+    # Smart Kids font: SVG artwork fills ~67.9% of advance, min-safe=0.712 (Chrome measurement A-Z/a-z).
+    "smartkids": 0.72,
+    # Cozy Winter font: SVG artwork fills ~57.8% of advance, min-safe=0.599 (Chrome measurement A-Z).
+    "cozywinter": 0.61,
     # camoblock, colorfulblocks, soccerarmy, paintsplashesrainbow, wavemermaid,
-    # cozywinter, smartkids, spiderweb: artwork fills full advance → 1.0 (no entry = default).
+    # spiderweb: artwork fills full advance → 1.0 (no entry = default).
 }
 
 def _resolve_font_key(font_name):
@@ -1099,8 +1103,8 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
         dpr = collage_img.width / collage_w if collage_w > 0 else 1.0
 
         # ── Baseline position in the rendered collage ────────────────────────
-        # vb_top = -850: baseline (y=0) sits 850 units from top of the
-        # 1200-unit window → baseline_y_px = (850/1200) * glyph_h ≈ 0.708·h
+        # vb_top = -850, vb_h_render = 1000: baseline (y=0) sits 850 units from top
+        # → baseline_y_px = (850/1000) * glyph_h = 0.85·h
         _vb_top_abs   = 850
         baseline_y_px = int(_vb_top_abs / vb_h_render * glyph_h)
         # sf strictly from the 1000-unit Em Square (same as scale)
@@ -1134,8 +1138,8 @@ def build_text_layer_chrome(text_lines, font_name, colour_hex, canvas_w):
                 if len(_vis) > 0:
                     _yt = int(_vis[0]);  _yb = int(_vis[-1]) + 1
                     glyph_imgs_raw[ch] = img_rgba.crop((0, _yt, img_rgba.width, _yb))
-                    glyph_above_bl[ch] = _yb - _yt   # visible height (for bottom-align)
-                    glyph_below_bl[ch] = 0
+                    glyph_above_bl[ch] = max(0, min(baseline_y_px, _yb) - _yt)
+                    glyph_below_bl[ch] = max(0, _yb - baseline_y_px)
                 else:
                     glyph_imgs_raw[ch] = None
                     glyph_above_bl[ch] = 0
