@@ -613,6 +613,43 @@ def find_images_for_item(order_item_id):
 
 # ─── PSD WRITER ───────────────────────────────────────────────────────────────
 
+_SWOP_PROFILE   = r'C:\Windows\System32\spool\drivers\color\RSWOP.icm'
+_SRGB_PROFILE   = 'sRGB'
+_rgb_to_cmyk_xf = None  # cached ImageCms transform
+
+def _get_rgb_to_cmyk():
+    """Return a cached ICC-aware sRGB → CMYK transform, or None if unavailable."""
+    global _rgb_to_cmyk_xf
+    if _rgb_to_cmyk_xf is not None:
+        return _rgb_to_cmyk_xf
+    try:
+        from PIL import ImageCms
+        src  = ImageCms.createProfile(_SRGB_PROFILE)
+        dst  = ImageCms.getOpenProfile(_SWOP_PROFILE)
+        _rgb_to_cmyk_xf = ImageCms.buildTransformFromOpenProfiles(
+            src, dst, 'RGB', 'CMYK',
+            renderingIntent=ImageCms.Intent.PERCEPTUAL)
+        return _rgb_to_cmyk_xf
+    except Exception:
+        return None
+
+def _rgb_to_cmyk(rgb_img):
+    """Convert RGB image to CMYK using ICC profile; snaps near-black pixels to pure K."""
+    import numpy as np
+    rgb = rgb_img.convert('RGB')
+    xf  = _get_rgb_to_cmyk()
+    if xf:
+        from PIL import ImageCms
+        cmyk = ImageCms.applyTransform(rgb, xf)
+    else:
+        cmyk = rgb.convert('CMYK')
+    # Snap near-black RGB pixels to pure K to avoid brownish rich-black artefacts
+    rgb_arr  = np.array(rgb)
+    cmyk_arr = np.array(cmyk)
+    dark     = rgb_arr.max(axis=2) < 25          # all channels very dark
+    cmyk_arr[dark] = [0, 0, 0, 255]              # pure K in PIL CMYK space
+    return Image.fromarray(cmyk_arr, 'CMYK')
+
 def _to_channels(img, mode):
     """Split image into raw channel bytes (no compression — matches PSD compression type 0).
 
@@ -628,11 +665,11 @@ def _to_channels(img, mode):
     if mode == 'CMYKA':
         rgba = img.convert('RGBA')
         a    = rgba.split()[3]
-        cmyk = rgba.convert('RGB').convert('CMYK')
+        cmyk = _rgb_to_cmyk(rgba)
         c, m, y, k = cmyk.split()
         return {-1: a.tobytes(), 0: _inv(c), 1: _inv(m), 2: _inv(y), 3: _inv(k)}
     if mode == 'CMYK':
-        cmyk = img.convert('RGB').convert('CMYK')
+        cmyk = _rgb_to_cmyk(img)
         c, m, y, k = cmyk.split()
         return {0: _inv(c), 1: _inv(m), 2: _inv(y), 3: _inv(k)}
     img = img.convert(mode)
@@ -781,6 +818,29 @@ def upscale_image(img_pil, target_w, target_h):
 
 # ─── LAYER BUILDERS ───────────────────────────────────────────────────────────
 
+def _crop_dark_borders(img_rgba, dark_threshold=30, dark_ratio=0.85):
+    """Crop black letterbox bars from phone screenshots (dark edges on 85%+ of pixels)."""
+    import numpy as np
+    arr = np.array(img_rgba.convert('RGB'))
+    h, w = arr.shape[:2]
+    brightness = arr.max(axis=2)   # per-pixel max channel value
+
+    def is_dark_row(r): return (brightness[r] < dark_threshold).mean() >= dark_ratio
+    def is_dark_col(c): return (brightness[:, c] < dark_threshold).mean() >= dark_ratio
+
+    top = 0
+    while top < h and is_dark_row(top): top += 1
+    bottom = h
+    while bottom > top and is_dark_row(bottom - 1): bottom -= 1
+    left = 0
+    while left < w and is_dark_col(left): left += 1
+    right = w
+    while right > left and is_dark_col(right - 1): right -= 1
+
+    if top > 0 or bottom < h or left > 0 or right < w:
+        return img_rgba.crop((left, top, right, bottom))
+    return img_rgba
+
 def build_image_layer(img_path, w, h, do_bg_remove=False, upscale=True):
     """Scale image to fit within zone (aspect-ratio preserved). Optionally removes background."""
     if not img_path or not os.path.isfile(img_path):
@@ -799,10 +859,12 @@ def build_image_layer(img_path, w, h, do_bg_remove=False, upscale=True):
             src = Image.open(img_path).convert('RGBA')
     else:
         src = ImageOps.exif_transpose(Image.open(img_path)).convert('RGBA')
-        # Auto-crop transparent borders from customer-uploaded images
+        # Auto-crop transparent borders
         bbox = src.getbbox()
         if bbox and (bbox[0] > 0 or bbox[1] > 0 or bbox[2] < src.width or bbox[3] < src.height):
             src = src.crop(bbox)
+        # Auto-crop dark letterbox borders (phone screenshots)
+        src = _crop_dark_borders(src)
     # AI upscale to canvas size, then final exact resize if needed.
     ratio_w = w / src.width
     ratio_h = h / src.height

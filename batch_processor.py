@@ -2771,11 +2771,11 @@ def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, 
             cat_dir = os.path.join(out_dir, folder_type)
         os.makedirs(cat_dir, exist_ok=True)
 
-        # Filename: single item → OrderID_SKU.psd, multi-item → OrderID_SKU_Nitems.psd
+        # Filename: OrderID.psd
         if len(group_rows) == 1:
-            base_name = f"{safe_id}_{sku}.psd"
+            base_name = f"{safe_id}.psd"
         else:
-            base_name = f"{safe_id}_{sku}_{len(group_rows)}items.psd"
+            base_name = f"{safe_id}_{len(group_rows)}items.psd"
         base_path = os.path.join(cat_dir, base_name)
         out_path  = base_path
         counter   = 2
