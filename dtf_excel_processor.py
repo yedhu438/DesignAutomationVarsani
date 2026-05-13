@@ -628,7 +628,7 @@ def _get_rgb_to_cmyk():
         dst  = ImageCms.getOpenProfile(_SWOP_PROFILE)
         _rgb_to_cmyk_xf = ImageCms.buildTransformFromOpenProfiles(
             src, dst, 'RGB', 'CMYK',
-            renderingIntent=ImageCms.Intent.PERCEPTUAL)
+            renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC)
         return _rgb_to_cmyk_xf
     except Exception:
         return None
