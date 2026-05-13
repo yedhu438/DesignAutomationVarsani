@@ -632,19 +632,10 @@ def _to_channels(img, mode):
     return {0: r.tobytes(), 1: g.tobytes(), 2: b.tobytes()}
 
 def write_psd(out_path, canvas_w, canvas_h, layers):
-    """Write a layered PSD file using psd-tools (Photoshop-compatible).
-    Falls back to a raw binary writer for PSB (canvas > 30 000px) since
-    psd-tools does not support the PSB (version 2) format.
-    """
-    PSB_MAX = 30000
-    use_psb = canvas_w > PSB_MAX or canvas_h > PSB_MAX
-    if use_psb and out_path.lower().endswith('.psd'):
-        out_path = out_path[:-4] + '.psb'
-
+    """Write a layered PSD file (raw binary writer)."""
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-    # ── Raw binary writer ─────────────────────────────────────────────────────
-    version = 2 if use_psb else 1
+    version = 1
 
     buf = io.BytesIO()
     p   = buf.write
@@ -686,10 +677,7 @@ def write_psd(out_path, canvas_w, canvas_h, layers):
         lr.write(struct.pack('>H', 4))
         for cid in ch_order:
             ch_len = len(ch[cid]) + 2
-            if use_psb:
-                lr.write(struct.pack('>hQ', cid, ch_len))
-            else:
-                lr.write(struct.pack('>hI', cid, ch_len))
+            lr.write(struct.pack('>hI', cid, ch_len))
         lr.write(b'8BIM')
         lr.write(b'norm')
         lr.write(struct.pack('>B', lyr.get('opacity', 255)))
@@ -710,12 +698,8 @@ def write_psd(out_path, canvas_w, canvas_h, layers):
     if len(layer_info) % 4:
         layer_info += b'\x00' * (4 - len(layer_info) % 4)
 
-    if use_psb:
-        lmi = struct.pack('>Q', len(layer_info)) + layer_info + struct.pack('>I', 0)
-        p(struct.pack('>Q', len(lmi)))
-    else:
-        lmi = struct.pack('>I', len(layer_info)) + layer_info + struct.pack('>I', 0)
-        p(struct.pack('>I', len(lmi)))
+    lmi = struct.pack('>I', len(layer_info)) + layer_info + struct.pack('>I', 0)
+    p(struct.pack('>I', len(lmi)))
     p(lmi)
 
     composite = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
@@ -2221,58 +2205,46 @@ def build_psd_for_order(order_id, row, out_path, no_bg_remove=False):
         zone["_content_h"] = content_h
         zone["_repeat_h"]  = repeat_h
 
-    # Canvas height based on actual rendered content (not spec zone height)
-    # For quantity > 1, copies are spaced by repeat_h (actual text/image size),
-    # but the last copy still occupies at least content_h (spec cutting area).
-    def zone_total_h(z, qty):
-        if qty <= 1:
-            return z["_content_h"]
-        return z["_repeat_h"] * (qty - 1) + QTY_GAP * (qty - 1) + z["_content_h"]
-
+    # One PSD per copy — canvas height is for a single copy only
     canvas_h = (PADDING
-                + sum(LABEL_H + zone_total_h(z, quantity) for z in zones)
+                + sum(LABEL_H + z["_content_h"] for z in zones)
                 + GAP * (len(zones) - 1)
                 + PADDING)
 
-    all_layers = []
-    y_cursor   = PADDING
+    written_paths = []
 
-    for zone in zones:
-        zw      = zone["w"]
-        x_left  = PADDING + (max_zw - zw) // 2
+    for copy_idx in range(quantity):
+        copy_layers = []
+        y_cursor    = PADDING
 
-        display_label = zone.get("display_label") or zone["label"]
-        lbl = build_label_layer(display_label)
-        all_layers.append({
-            "name":    f"{display_label} label",
-            "image":   lbl,
-            "top":     y_cursor,
-            "left":    x_left,
-            "opacity": 255,
-            "visible": True,
-        })
+        for zone_idx, zone in enumerate(zones):
+            zw     = zone["w"]
+            x_left = PADDING + (max_zw - zw) // 2
+            display_label = zone.get("display_label") or zone["label"]
 
-        content_start = y_cursor + LABEL_H
-        img_pil   = zone["_img"];  it = zone["_it"];  il = zone["_il"]
-        txt_pil   = zone["_txt"];  tt = zone["_tt"];  tl = zone["_tl"]
-        prev_img  = zone["_prev"]; pnw = zone["_pnw"]; pnh = zone["_pnh"]
-        txt_h     = zone["_txt_h"]
-        content_h = zone["_content_h"]
-        repeat_h  = zone["_repeat_h"]
+            lbl = build_label_layer(display_label)
+            copy_layers.append({
+                "name":    f"{display_label} label",
+                "image":   lbl,
+                "top":     y_cursor,
+                "left":    x_left,
+                "opacity": 255,
+                "visible": True,
+            })
 
-        for copy_idx in range(quantity):
-            # Use repeat_h as spacing between copies so text-only zones aren't
-            # stretched to full spec zone height for every copy
-            copy_top = content_start + copy_idx * (repeat_h + QTY_GAP)
-            suffix   = f" #{copy_idx + 1}" if quantity > 1 else ""
+            content_start = y_cursor + LABEL_H
+            img_pil  = zone["_img"];  it = zone["_it"];  il = zone["_il"]
+            txt_pil  = zone["_txt"];  tt = zone["_tt"];  tl = zone["_tl"]
+            prev_img = zone["_prev"]; pnw = zone["_pnw"]; pnh = zone["_pnh"]
+            txt_h    = zone["_txt_h"]
+            content_h = zone["_content_h"]
+            v_off    = zone.get("_txt_v_offset", 0)
 
-            # Text goes ABOVE the image (matches Amazon preview layout)
-            v_off = zone.get("_txt_v_offset", 0)
             if txt_pil:
                 _tl_dict = {
-                    "name":    f"{display_label} CustomerText{suffix}",
+                    "name":    f"{display_label} CustomerText",
                     "image":   txt_pil,
-                    "top":     copy_top + v_off + tt,
+                    "top":     content_start + v_off + tt,
                     "left":    x_left + tl,
                     "opacity": 255,
                     "visible": True,
@@ -2287,16 +2259,16 @@ def build_psd_for_order(order_id, row, out_path, no_bg_remove=False):
                         r=_r, g=_g, b=_b,
                         px_per_cm=PX_PER_CM,
                         layer_left=x_left + tl,
-                        layer_top=copy_top + v_off + tt,
+                        layer_top=content_start + v_off + tt,
                         layer_w=txt_pil.width,
                         layer_h=txt_pil.height,
                     )
-                all_layers.append(_tl_dict)
+                copy_layers.append(_tl_dict)
 
             if img_pil:
-                img_top = copy_top + txt_h + (TEXT_GAP if txt_pil else 0) + it
-                all_layers.append({
-                    "name":    f"{display_label} CustomerImage{suffix}",
+                img_top = content_start + txt_h + (TEXT_GAP if txt_pil else 0) + it
+                copy_layers.append({
+                    "name":    f"{display_label} CustomerImage",
                     "image":   img_pil,
                     "top":     img_top,
                     "left":    x_left + il,
@@ -2304,9 +2276,8 @@ def build_psd_for_order(order_id, row, out_path, no_bg_remove=False):
                     "visible": True,
                 })
 
-            # Preview reference: only one per zone (not duplicated for every copy)
-            if prev_img and copy_idx == 0:
-                all_layers.append({
+            if prev_img:
+                copy_layers.append({
                     "name":    f"{display_label} Preview Reference",
                     "image":   prev_img,
                     "top":     content_start + (content_h - pnh) // 2,
@@ -2315,16 +2286,26 @@ def build_psd_for_order(order_id, row, out_path, no_bg_remove=False):
                     "visible": False,
                 })
 
-        y_cursor += LABEL_H + zone_total_h(zone, quantity) + GAP
+            y_cursor += LABEL_H + content_h
+            if zone_idx < len(zones) - 1:
+                y_cursor += GAP
 
-    out_path = write_psd(out_path, canvas_w, canvas_h, all_layers)
+        if copy_idx == 0:
+            copy_path = out_path
+        else:
+            base = out_path[:-4] if out_path.lower().endswith('.psd') else out_path
+            copy_path = f"{base}-{copy_idx}.psd"
 
-    if not os.path.isfile(out_path):
+        actual = write_psd(copy_path, canvas_w, canvas_h, copy_layers)
+        if actual and os.path.isfile(actual):
+            written_paths.append(actual)
+
+    if not written_paths:
         return False, "PSD file not written"
 
-    size_mb    = os.path.getsize(out_path) / (1024 * 1024)
+    total_mb   = sum(os.path.getsize(p) for p in written_paths) / (1024 * 1024)
     zone_names = [z["label"] for z in zones]
-    return True, f"{size_mb:.1f} MB | zones: {zone_names}"
+    return True, f"{total_mb:.1f} MB total | {len(written_paths)} file(s) | zones: {zone_names}"
 
 
 def rows_have_same_design(rows):
@@ -2423,33 +2404,31 @@ def build_merged_psd_for_order_group(order_id, rows, out_path, no_bg_remove=Fals
 
     GAP = cm_to_px(0.5)  # gap between zones within the same item (front/back/sleeve)
 
-    # Canvas height: each zone stacked vertically, gaps between zones and between items
-    def item_height(zones):
+    def _row_canvas_h(zones):
         if not zones:
             return 0
-        return (sum(lbl_h + z["_content_h"] for z in zones)
-                + GAP * (len(zones) - 1))
-
-    canvas_h = (PADDING
-                + sum(item_height(zones) for zones in all_row_zones)
-                + QTY_GAP * (len(all_row_zones) - 1)
+        return (PADDING
+                + sum(lbl_h + z["_content_h"] for z in zones)
+                + GAP * (len(zones) - 1)
                 + PADDING)
 
-    all_layers = []
-    y_cursor   = PADDING
+    written_paths = []
 
     for row_idx, (row, zones) in enumerate(zip(rows, all_row_zones)):
         if not zones:
             continue
+
+        row_h      = _row_canvas_h(zones)
+        row_layers = []
+        y_cursor   = PADDING
 
         for zone_idx, zone in enumerate(zones):
             display_label = zone["display_label"]
             x_left    = PADDING + (max_zw - zone["w"]) // 2
             img_start = y_cursor + lbl_h
 
-            # Label
             lbl = build_label_layer(display_label)
-            all_layers.append({
+            row_layers.append({
                 "name": f"{display_label} label",
                 "image": lbl,
                 "top": y_cursor,
@@ -2457,7 +2436,6 @@ def build_merged_psd_for_order_group(order_id, rows, out_path, no_bg_remove=Fals
                 "opacity": 255, "visible": True,
             })
 
-            # Text goes ABOVE the image; for text-only zones it is vertically centred
             v_off = zone.get("_txt_v_offset", 0)
             if zone["_txt"]:
                 _tl_dict2 = {
@@ -2481,12 +2459,11 @@ def build_merged_psd_for_order_group(order_id, rows, out_path, no_bg_remove=Fals
                         layer_w=zone["_txt"].width,
                         layer_h=zone["_txt"].height,
                     )
-                all_layers.append(_tl_dict2)
+                row_layers.append(_tl_dict2)
 
-            # Image below text
             if zone["_img"]:
                 img_top = img_start + zone["_txt_h"] + (TEXT_GAP if zone["_txt"] else 0) + zone["_it"]
-                all_layers.append({
+                row_layers.append({
                     "name": f"{display_label} CustomerImage",
                     "image": zone["_img"],
                     "top": img_top,
@@ -2494,12 +2471,11 @@ def build_merged_psd_for_order_group(order_id, rows, out_path, no_bg_remove=Fals
                     "opacity": 255, "visible": True,
                 })
 
-            # Preview reference (invisible)
             if zone["_prev"]:
                 pnh       = zone["_pnh"]
                 pnw       = zone["_pnw"]
                 content_h = zone["_content_h"]
-                all_layers.append({
+                row_layers.append({
                     "name":    f"{display_label} Preview Reference",
                     "image":   zone["_prev"],
                     "top":     img_start + (content_h - pnh) // 2,
@@ -2508,22 +2484,26 @@ def build_merged_psd_for_order_group(order_id, rows, out_path, no_bg_remove=Fals
                     "visible": False,
                 })
 
-            # Advance y after each zone
             y_cursor += lbl_h + zone["_content_h"]
             if zone_idx < len(zones) - 1:
-                y_cursor += GAP  # gap between zones in same item
+                y_cursor += GAP
 
-        if row_idx < len(all_row_zones) - 1:
-            y_cursor += QTY_GAP  # gap between items
+        if row_idx == 0:
+            row_path = out_path
+        else:
+            base = out_path[:-4] if out_path.lower().endswith('.psd') else out_path
+            row_path = f"{base}-{row_idx}.psd"
 
-    out_path = write_psd(out_path, canvas_w, canvas_h, all_layers)
+        actual = write_psd(row_path, canvas_w, row_h, row_layers)
+        if actual and os.path.isfile(actual):
+            written_paths.append(actual)
 
-    if not os.path.isfile(out_path):
+    if not written_paths:
         return False, "PSD file not written"
 
-    size_mb = os.path.getsize(out_path) / (1024 * 1024)
-    labels  = [z.get("display_label") for zones in all_row_zones for z in zones]
-    return True, f"{size_mb:.1f} MB | labels: {labels}"
+    total_mb = sum(os.path.getsize(p) for p in written_paths) / (1024 * 1024)
+    labels   = [z.get("display_label") for zones in all_row_zones for z in zones]
+    return True, f"{total_mb:.1f} MB total | {len(written_paths)} file(s) | labels: {labels}"
 
 
 # ─── DATABASE ─────────────────────────────────────────────────────────────────
@@ -2710,6 +2690,21 @@ def gdrive_upload_psd(local_path, date_str, folder_type, colour_sub):
         return False
 
 
+def _get_psd_split_paths(base_path):
+    """Return base_path plus any -1, -2, ... split files that exist alongside it."""
+    paths = [base_path] if os.path.isfile(base_path) else []
+    root = base_path[:-4] if base_path.lower().endswith('.psd') else base_path
+    i = 1
+    while True:
+        p = f"{root}-{i}.psd"
+        if os.path.isfile(p):
+            paths.append(p)
+            i += 1
+        else:
+            break
+    return paths
+
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, multizone=False, reprocess=False, date_filter=None, date_after=None, upload_gdrive=False, no_bg_remove=False, output_folder=None, font_filter=None):
@@ -2814,7 +2809,8 @@ def run_batch(limit=None, order_id_filter=None, dry_run=False, sku_filter=None, 
                 log(f"  OK  {msg}", "OK")
                 ok_count += 1
                 if upload_gdrive and not dry_run:
-                    gdrive_upload_psd(out_path, today, folder_type, colour_sub)
+                    for _split in _get_psd_split_paths(out_path):
+                        gdrive_upload_psd(_split, today, folder_type, colour_sub)
             else:
                 log(f"  FAIL  {msg}", "FAIL")
                 fail_count += 1
