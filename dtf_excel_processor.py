@@ -159,8 +159,8 @@ for _folder in FONT_FOLDERS:
                 FONT_INDEX[_norm] = os.path.join(_folder, _f)
 
 FONT_ALIASES = {
-    "arial":           "arial",
-    "arialbold":       "arial",
+    "arial":           "arialbold",
+    "arialbold":       "arialbold",
     "abel":            "abel",
     "bebasneue":       "bebasneueregular",
     "bebasneuepro":    "bebasneueregular",
@@ -244,7 +244,7 @@ def get_font(font_name, size_px):
                 except Exception:
                     pass
     try:
-        return ImageFont.truetype("arial.ttf", size_px)
+        return ImageFont.truetype("arialbd.ttf", size_px)
     except Exception:
         return ImageFont.load_default()
 
@@ -336,7 +336,7 @@ def parse_font_name(row, zone):
                 return normal, False
         except Exception:
             pass
-    return 'Arial', False
+    return 'Arial Bold', False
 
 def parse_colour_hex(row, zone):
     """Return hex colour string for a zone, e.g. '#d1c9c9'."""
@@ -1122,7 +1122,7 @@ def build_label_layer(text):
     """Small black label rendered at top of each zone."""
     size = max(18, cm(0.4))
     try:
-        f = ImageFont.truetype('arial.ttf', size)
+        f = ImageFont.truetype('arialbd.ttf', size)
     except Exception:
         f = ImageFont.load_default()
     tmp  = Image.new('RGBA', (1, 1))
@@ -1457,14 +1457,23 @@ def process_excel_orders(limit=None, dry_run=False, order_id=None):
         for rr, src_idx in zip(rendered_rows, row_data_source):
             row_groups.setdefault(src_idx, []).append(rr)
 
+        # Batch into files of max 3 items each
+        MAX_ITEMS_PER_FILE = 3
+        items_list = list(row_groups.values())   # list of per-item rendered_rows groups
+        batches = [items_list[i:i + MAX_ITEMS_PER_FILE]
+                   for i in range(0, len(items_list), MAX_ITEMS_PER_FILE)]
+        total_files = len(batches)
+
         item_ok = True
-        for src_idx, group in row_groups.items():
-            src_row  = rows[src_idx]
-            if len(row_groups) > 1:
-                suffix = f'{src_idx + 1}of{len(row_groups)}'
+        for file_idx, batch in enumerate(batches):
+            if total_files > 1:
+                suffix = f'{file_idx + 1}of{total_files}'
             else:
                 suffix = None
             item_path = os.path.join(cat_dir, f'{safe_id}_{suffix}.psd' if suffix else f'{safe_id}.psd')
+
+            # Flatten all items in this batch into one canvas
+            group = [zones for item_rows in batch for zones in item_rows]
 
             # Build canvas for this item (qty copies stacked)
             max_zw_item   = max(z['zw'] for zones in group for z in zones)
