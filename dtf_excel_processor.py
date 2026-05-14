@@ -24,11 +24,12 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-EXCEL_FILE    = r"W:\test 8\UnshippedDTFOrders_20042026_014056.xlsx"
-IMAGE_FOLDER  = r"W:\test 8\DTFUnshippedImages_20260420_014001"
-OUTPUT_FOLDER = r"C:\Varsany\Output\DTF_Excel"
-FONT_FOLDERS  = [r"C:\Varsany\Fonts", r"W:\fonts"]
-LOG_FILE      = r"C:\Varsany\Output\DTF_Excel\dtf_excel_log.txt"
+_test_base    = r"C:\Users\Revathi\OneDrive\Documents\varsany\test 8\test 8"
+EXCEL_FILE    = os.environ.get("DTF_EXCEL",   os.path.join(_test_base, "UnshippedDTFOrders_20042026_014056.xlsx"))
+IMAGE_FOLDER  = os.environ.get("DTF_IMAGES",  os.path.join(_test_base, "DTFUnshippedImages_20260420_014001"))
+OUTPUT_FOLDER = os.environ.get("DTF_OUTPUT",  r"C:\Varsany\Output\DTF_Excel")
+FONT_FOLDERS  = [r"C:\Varsany\Fonts", r"W:\fonts", r"C:\Windows\Fonts"]
+LOG_FILE      = os.path.join(OUTPUT_FOLDER, "dtf_excel_log.txt")
 
 PX_PER_CM = 120          # 304 DPI for test — change to 320 for production
 DPI       = int(PX_PER_CM * 2.54)
@@ -158,8 +159,8 @@ for _folder in FONT_FOLDERS:
                 FONT_INDEX[_norm] = os.path.join(_folder, _f)
 
 FONT_ALIASES = {
-    "arial":           "arial",
-    "arialbold":       "arial",
+    "arial":           "arialbold",
+    "arialbold":       "arialbold",
     "abel":            "abel",
     "bebasneue":       "bebasneueregular",
     "bebasneuepro":    "bebasneueregular",
@@ -243,7 +244,7 @@ def get_font(font_name, size_px):
                 except Exception:
                     pass
     try:
-        return ImageFont.truetype("arial.ttf", size_px)
+        return ImageFont.truetype("arialbd.ttf", size_px)
     except Exception:
         return ImageFont.load_default()
 
@@ -335,7 +336,7 @@ def parse_font_name(row, zone):
                 return normal, False
         except Exception:
             pass
-    return 'Arial', False
+    return 'Arial Bold', False
 
 def parse_colour_hex(row, zone):
     """Return hex colour string for a zone, e.g. '#d1c9c9'."""
@@ -612,6 +613,43 @@ def find_images_for_item(order_item_id):
 
 # ─── PSD WRITER ───────────────────────────────────────────────────────────────
 
+_SWOP_PROFILE   = r'C:\Windows\System32\spool\drivers\color\RSWOP.icm'
+_SRGB_PROFILE   = 'sRGB'
+_rgb_to_cmyk_xf = None  # cached ImageCms transform
+
+def _get_rgb_to_cmyk():
+    """Return a cached ICC-aware sRGB → CMYK transform, or None if unavailable."""
+    global _rgb_to_cmyk_xf
+    if _rgb_to_cmyk_xf is not None:
+        return _rgb_to_cmyk_xf
+    try:
+        from PIL import ImageCms
+        src  = ImageCms.createProfile(_SRGB_PROFILE)
+        dst  = ImageCms.getOpenProfile(_SWOP_PROFILE)
+        _rgb_to_cmyk_xf = ImageCms.buildTransformFromOpenProfiles(
+            src, dst, 'RGB', 'CMYK',
+            renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC)
+        return _rgb_to_cmyk_xf
+    except Exception:
+        return None
+
+def _rgb_to_cmyk(rgb_img):
+    """Convert RGB image to CMYK using ICC profile; snaps near-black pixels to pure K."""
+    import numpy as np
+    rgb = rgb_img.convert('RGB')
+    xf  = _get_rgb_to_cmyk()
+    if xf:
+        from PIL import ImageCms
+        cmyk = ImageCms.applyTransform(rgb, xf)
+    else:
+        cmyk = rgb.convert('CMYK')
+    # Snap near-black RGB pixels to pure K to avoid brownish rich-black artefacts
+    rgb_arr  = np.array(rgb)
+    cmyk_arr = np.array(cmyk)
+    dark     = rgb_arr.max(axis=2) < 25          # all channels very dark
+    cmyk_arr[dark] = [0, 0, 0, 255]              # pure K in PIL CMYK space
+    return Image.fromarray(cmyk_arr, 'CMYK')
+
 def _to_channels(img, mode):
     """Split image into raw channel bytes (no compression — matches PSD compression type 0).
 
@@ -627,11 +665,11 @@ def _to_channels(img, mode):
     if mode == 'CMYKA':
         rgba = img.convert('RGBA')
         a    = rgba.split()[3]
-        cmyk = rgba.convert('RGB').convert('CMYK')
+        cmyk = _rgb_to_cmyk(rgba)
         c, m, y, k = cmyk.split()
         return {-1: a.tobytes(), 0: _inv(c), 1: _inv(m), 2: _inv(y), 3: _inv(k)}
     if mode == 'CMYK':
-        cmyk = img.convert('RGB').convert('CMYK')
+        cmyk = _rgb_to_cmyk(img)
         c, m, y, k = cmyk.split()
         return {0: _inv(c), 1: _inv(m), 2: _inv(y), 3: _inv(k)}
     img = img.convert(mode)
@@ -649,17 +687,12 @@ def _pack_layer_name(name):
 
 def write_psd(out_path, canvas_w, canvas_h, layers):
     """
-    Write a layered RGB PSD (or PSB for large files) file.
-    Auto-switches to PSB when estimated size exceeds 1.5 GB.
+    Write a layered PSD file. Large orders are split upstream; never writes PSB.
     Layers: list of dicts with image/top/left/name/opacity/visible.
     """
-    # Always write PSD — printing software does not support PSB
-    psb = False
-
-    # PSB uses 8-byte length fields; PSD uses 4-byte
-    ch_len_fmt   = '>hQ' if psb else '>hI'   # channel data length in layer record
-    sec_len_fmt  = '>Q'  if psb else '>I'    # layer info / lmi section lengths
-    version      = 2     if psb else 1
+    ch_len_fmt = '>hI'
+    sec_len_fmt = '>I'
+    version     = 1
 
     buf = io.BytesIO()
     p   = buf.write
@@ -796,6 +829,29 @@ def upscale_image(img_pil, target_w, target_h):
 
 # ─── LAYER BUILDERS ───────────────────────────────────────────────────────────
 
+def _crop_dark_borders(img_rgba, dark_threshold=30, dark_ratio=0.85):
+    """Crop black letterbox bars from phone screenshots (dark edges on 85%+ of pixels)."""
+    import numpy as np
+    arr = np.array(img_rgba.convert('RGB'))
+    h, w = arr.shape[:2]
+    brightness = arr.max(axis=2)   # per-pixel max channel value
+
+    def is_dark_row(r): return (brightness[r] < dark_threshold).mean() >= dark_ratio
+    def is_dark_col(c): return (brightness[:, c] < dark_threshold).mean() >= dark_ratio
+
+    top = 0
+    while top < h and is_dark_row(top): top += 1
+    bottom = h
+    while bottom > top and is_dark_row(bottom - 1): bottom -= 1
+    left = 0
+    while left < w and is_dark_col(left): left += 1
+    right = w
+    while right > left and is_dark_col(right - 1): right -= 1
+
+    if (top > 0 or bottom < h or left > 0 or right < w) and right > left and bottom > top:
+        return img_rgba.crop((left, top, right, bottom))
+    return img_rgba
+
 def build_image_layer(img_path, w, h, do_bg_remove=False, upscale=True):
     """Scale image to fit within zone (aspect-ratio preserved). Optionally removes background."""
     if not img_path or not os.path.isfile(img_path):
@@ -814,10 +870,14 @@ def build_image_layer(img_path, w, h, do_bg_remove=False, upscale=True):
             src = Image.open(img_path).convert('RGBA')
     else:
         src = ImageOps.exif_transpose(Image.open(img_path)).convert('RGBA')
-        # Auto-crop transparent borders from customer-uploaded images
+        # Auto-crop transparent borders
         bbox = src.getbbox()
         if bbox and (bbox[0] > 0 or bbox[1] > 0 or bbox[2] < src.width or bbox[3] < src.height):
             src = src.crop(bbox)
+        # Auto-crop dark letterbox borders (phone screenshots)
+        src = _crop_dark_borders(src)
+    if src.width == 0 or src.height == 0:
+        return Image.new('RGBA', (max(1, w), max(1, h)), (0, 0, 0, 0)), 0, 0
     # AI upscale to canvas size, then final exact resize if needed.
     ratio_w = w / src.width
     ratio_h = h / src.height
@@ -1082,7 +1142,7 @@ def build_label_layer(text):
     """Small black label rendered at top of each zone."""
     size = max(18, cm(0.4))
     try:
-        f = ImageFont.truetype('arial.ttf', size)
+        f = ImageFont.truetype('arialbd.ttf', size)
     except Exception:
         f = ImageFont.load_default()
     tmp  = Image.new('RGBA', (1, 1))
@@ -1283,7 +1343,8 @@ def process_excel_orders(limit=None, dry_run=False, order_id=None):
 
         # Each row corresponds to one item (one SKU / OrderItemID)
         row_data = []
-        for row in rows:
+        row_data_source = []  # index into rows[] for each entry in row_data
+        for row_idx, row in enumerate(rows):
             item_id   = _safe(row.get('OrderItemID')) or ''
             row_sku   = _safe(row.get('SKU')) or sku_raw
             row_prod  = detect_product(row_sku)
@@ -1341,6 +1402,7 @@ def process_excel_orders(limit=None, dry_run=False, order_id=None):
             qty = int(row.get('Quantity', 1) or 1)
             for _ in range(qty):
                 row_data.append(zones_for_row)
+                row_data_source.append(row_idx)
 
         flat_zones = [z for zones in row_data for z in zones]
         if not flat_zones:
@@ -1404,70 +1466,84 @@ def process_excel_orders(limit=None, dry_run=False, order_id=None):
                 rendered_zones_list.append({**zone, 'zone_layers': zone_layers, 'content_h': content_h})
             rendered_rows.append(rendered_zones_list)
 
-        # ── Calculate canvas from actual content heights ─────────────────────
-        max_zw   = max(z['zw'] for zones in rendered_rows for z in zones)
-        canvas_w = PADDING + max_zw + PADDING
-        canvas_h = PADDING  # top padding only
-        for zones in rendered_rows:
-            for z in zones:
-                canvas_h += LABEL_H + z['content_h'] + GAP
-        canvas_h -= GAP        # remove trailing gap after last zone
-        canvas_h += cm(1.5)    # fixed 1.5 cm bottom margin
-        canvas_h = max(1, int(canvas_h))
-
-        # ── Place layers ────────────────────────────────────────────────────
-        # Labels go into a separate list so we can append them LAST,
-        # making them the topmost layers in Photoshop (always visible on top).
-        label_layers = []
-        y = PADDING
-        for zones in rendered_rows:
-            for zone in zones:
-                zw         = zone['zw']
-                content_h  = zone['content_h']
-                x_centre   = PADDING + (max_zw - zw) // 2
-
-                # Zone label — collected separately, added on top at the end
-                lbl     = build_label_layer(zone['label'])
-                lbl_top = y
-                label_layers.append({'name': f"{zone['label']} Label",
-                                     'image': lbl, 'top': lbl_top, 'left': x_centre,
-                                     'opacity': 255, 'visible': True})
-                img_top = y + LABEL_H
-
-                for (lname, lpil, lt, ll, lvis) in zone['zone_layers']:
-                    all_layers.append({'name': lname, 'image': lpil,
-                                       'top': img_top + lt, 'left': x_centre + ll,
-                                       'opacity': 255, 'visible': lvis})
-
-                y += LABEL_H + content_h + GAP
-
-        # Labels on top so they're never buried under content layers
-        all_layers.extend(label_layers)
-
-        # ── Write PSD ───────────────────────────────────────────────────────
+        # ── Write PSDs — one per item for multi-item orders ──────────────────
         folder_type = make_folder_type(rows, images_by_item)
         colour_sub  = sku_colour_folder(sku_raw)
-        if colour_sub:
-            cat_dir = os.path.join(out_dir, folder_type, colour_sub)
-        else:
-            cat_dir = os.path.join(out_dir, folder_type)
+        cat_dir     = os.path.join(out_dir, folder_type, colour_sub) if colour_sub else os.path.join(out_dir, folder_type)
         os.makedirs(cat_dir, exist_ok=True)
-        suffix   = f'{safe_sku}_{len(rows)}items' if len(rows) > 1 else safe_sku
-        out_path = os.path.join(cat_dir, f'{safe_id}_{suffix}.psd')
+
+        # Group rendered_rows by source row — handles Quantity > 1 stacking
+        row_groups = {}
+        for rr, src_idx in zip(rendered_rows, row_data_source):
+            row_groups.setdefault(src_idx, []).append(rr)
+
+        # Batch into files of max 3 items each
+        MAX_ITEMS_PER_FILE = 3
+        items_list = list(row_groups.values())   # list of per-item rendered_rows groups
+        batches = [items_list[i:i + MAX_ITEMS_PER_FILE]
+                   for i in range(0, len(items_list), MAX_ITEMS_PER_FILE)]
+        total_files = len(batches)
+
+        item_ok = True
+        for file_idx, batch in enumerate(batches):
+            if total_files > 1:
+                suffix = f'{file_idx + 1}of{total_files}'
+            else:
+                suffix = None
+            item_path = os.path.join(cat_dir, f'{safe_id}_{suffix}.psd' if suffix else f'{safe_id}.psd')
+
+            # Flatten all items in this batch into one canvas
+            group = [zones for item_rows in batch for zones in item_rows]
+
+            # Build canvas for this item (qty copies stacked)
+            max_zw_item   = max(z['zw'] for zones in group for z in zones)
+            canvas_w_item = PADDING + max_zw_item + PADDING
+            canvas_h_item = PADDING
+            for zones in group:
+                for z in zones:
+                    canvas_h_item += LABEL_H + z['content_h'] + GAP
+            canvas_h_item -= GAP
+            canvas_h_item += cm(1.5)
+            canvas_h_item = max(1, int(canvas_h_item))
+
+            item_layers  = []
+            label_layers = []
+            y = PADDING
+            for zones in group:
+                for zone in zones:
+                    zw        = zone['zw']
+                    content_h = zone['content_h']
+                    x_centre  = PADDING + (max_zw_item - zw) // 2
+                    lbl = build_label_layer(zone['label'])
+                    label_layers.append({'name': f"{zone['label']} Label",
+                                         'image': lbl, 'top': y, 'left': x_centre,
+                                         'opacity': 255, 'visible': True})
+                    img_top = y + LABEL_H
+                    for (lname, lpil, lt, ll, lvis) in zone['zone_layers']:
+                        item_layers.append({'name': lname, 'image': lpil,
+                                           'top': img_top + lt, 'left': x_centre + ll,
+                                           'opacity': 255, 'visible': lvis})
+                    y += LABEL_H + content_h + GAP
+            item_layers.extend(label_layers)
+
+            if dry_run:
+                log(f'  DRY-RUN -> {item_path}  ({len(item_layers)} layers)', 'OK')
+                continue
+
+            try:
+                write_psd(item_path, canvas_w_item, canvas_h_item, item_layers)
+                size_mb = os.path.getsize(item_path) / 1024 / 1024
+                log(f'  OK  {size_mb:.1f} MB  -> {item_path}', 'OK')
+            except Exception as e:
+                log(f'  FAIL  {e}', 'FAIL')
+                log(traceback.format_exc()[-500:], 'ERROR')
+                item_ok = False
 
         if dry_run:
-            log(f'  DRY-RUN -> {out_path}  ({len(all_layers)} layers)', 'OK')
             ok_count += 1
-            continue
-
-        try:
-            out_path = write_psd(out_path, canvas_w, canvas_h, all_layers)
-            size_mb = os.path.getsize(out_path) / 1024 / 1024
-            log(f'  OK  {size_mb:.1f} MB  -> {out_path}', 'OK')
+        elif item_ok:
             ok_count += 1
-        except Exception as e:
-            log(f'  FAIL  {e}', 'FAIL')
-            log(traceback.format_exc()[-500:], 'ERROR')
+        else:
             fail_count += 1
 
     log('=' * 60)

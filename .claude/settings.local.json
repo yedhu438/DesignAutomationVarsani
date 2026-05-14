@@ -22,7 +22,13 @@
       "Bash(python batch_processor.py --date-after 2026-04-10)",
       "Bash(net use:*)",
       "Read(//w/images/**)",
-      "Bash(python batch_processor.py --limit 5 --date-after 2026-04-05)"
+      "Bash(python batch_processor.py --limit 5 --date-after 2026-04-05)",
+      "Bash(git add *)",
+      "Bash(git merge *)",
+      "Bash(git stash *)",
+      "Bash(python -c \"import batch_processor\")",
+      "Bash('C:/Program Files/Microsoft SQL Server/Client SDK/ODBC/180/Tools/Binn/SQLCMD.EXE' -S 'localhost\\\\SQLEXPRESS' -E -No -d dbAmazonCustomOrders -Q ' *)",
+      "Bash(python batch_processor.py --order 026-8139399-3398712 --reprocess)"
     ],
     "deny": [],
     "ask": []
