@@ -218,11 +218,11 @@ def cm_to_px(cm): return int(round(cm * PX_PER_CM))
 # ─── CANVAS SIZES — from owner Canvases.xlsx ──────────────────────────────────
 PRODUCT_CANVAS = {
     # T-shirts
-    "adulttshirt":    {"front": (cm_to_px(30), cm_to_px(30)), "back": (cm_to_px(30), cm_to_px(30)), "pocket": (cm_to_px(9),  cm_to_px(7))},
-    "kidstshirt":     {"front": (cm_to_px(23), cm_to_px(30)), "back": (cm_to_px(23), cm_to_px(30)), "pocket": (cm_to_px(9),  cm_to_px(7))},
+    "adulttshirt":    {"front": (cm_to_px(30), cm_to_px(30)), "back": (cm_to_px(30), cm_to_px(30)), "pocket": (cm_to_px(9),  cm_to_px(9))},
+    "kidstshirt":     {"front": (cm_to_px(23), cm_to_px(30)), "back": (cm_to_px(23), cm_to_px(30)), "pocket": (cm_to_px(9),  cm_to_px(9))},
     # Hoodies
-    "adulthoodie":    {"front": (cm_to_px(25), cm_to_px(25)), "back": (cm_to_px(25), cm_to_px(25)), "pocket": (cm_to_px(9),  cm_to_px(7)), "sleeve": (cm_to_px(9), cm_to_px(7))},
-    "kidshoodie":     {"front": (cm_to_px(23), cm_to_px(20)), "back": (cm_to_px(23), cm_to_px(20)), "pocket": (cm_to_px(9),  cm_to_px(7))},
+    "adulthoodie":    {"front": (cm_to_px(25), cm_to_px(25)), "back": (cm_to_px(25), cm_to_px(25)), "pocket": (cm_to_px(9),  cm_to_px(9)), "sleeve": (cm_to_px(9), cm_to_px(7))},
+    "kidshoodie":     {"front": (cm_to_px(23), cm_to_px(20)), "back": (cm_to_px(23), cm_to_px(20)), "pocket": (cm_to_px(9),  cm_to_px(9))},
     # Bags
     "totebag":        {"front": (cm_to_px(28), cm_to_px(28)), "back": (cm_to_px(28), cm_to_px(28))},
     "backpack":       {"front": (cm_to_px(18), cm_to_px(12))},
@@ -247,7 +247,7 @@ PRODUCT_CANVAS = {
     "golfcase":       {"front": (cm_to_px(15), cm_to_px(6))},
     "slipper":        {"front": (cm_to_px(6),  cm_to_px(6))},
     # Default fallback
-    "default":        {"front": (cm_to_px(30), cm_to_px(30)), "back": (cm_to_px(30), cm_to_px(30)), "pocket": (cm_to_px(9), cm_to_px(7))},
+    "default":        {"front": (cm_to_px(30), cm_to_px(30)), "back": (cm_to_px(30), cm_to_px(30)), "pocket": (cm_to_px(9), cm_to_px(9))},
 }
 
 # ─── SKU PREFIX → PRODUCT KEY — from owner Canvases.xlsx ─────────────────────
@@ -261,7 +261,6 @@ SKU_MAP = [
     ("SignLan01_Tee_",                "adulttshirt"),
     ("Custom04_Tee_",                 "adulttshirt"),
     ("LegendSince",                   "adulttshirt"),
-    ("AnyTxt",                        "adulttshirt"),
     # Kids T-shirt
     ("KidsTee_",                      "kidstshirt"),
     ("SLan01KidsTee_",                "kidstshirt"),
@@ -302,6 +301,8 @@ SKU_MAP = [
     ("AnyTxtSlip",                    "slipper"),
     # Socks
     ("AnyTxtSocks",                   "socks"),
+    # Generic AnyTxt catch-all — MUST stay after all specific AnyTxt* entries above
+    ("AnyTxt",                        "adulttshirt"),
     # Cushion
     ("PCushion",                      "cushion"),
     # Custom Tee variants (same canvas as standard tees)
@@ -311,6 +312,28 @@ SKU_MAP = [
     ("GymLeo",                        "default"),
     ("SwimSuit",                      "default"),
 ]
+
+# Validate SKU_MAP at startup: catch any short prefix that would shadow a longer one
+# (detect_product uses longest-match, but this warns if first-match would have differed)
+def _validate_sku_map():
+    """Warn if a short catch-all prefix appears BEFORE a longer specific prefix with a different key.
+    If triggered, adding the new specific prefix before the catch-all will silence the warning."""
+    shadowed = []
+    for i, (short, short_key) in enumerate(SKU_MAP):
+        for j, (long_prefix, long_key) in enumerate(SKU_MAP):
+            if (long_prefix != short and long_prefix.startswith(short)
+                    and short_key != long_key and i < j):
+                shadowed.append(
+                    f"  '{short}' ({short_key}) at position {i} is before "
+                    f"'{long_prefix}' ({long_key}) at position {j} — move '{short}' after it"
+                )
+    if shadowed:
+        print("ERROR: SKU_MAP order wrong — catch-all prefix appears before specific one:")
+        for s in shadowed:
+            print(s)
+        print("  Fix: move the catch-all entry to AFTER all its specific variants in SKU_MAP.")
+
+_validate_sku_map()
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -554,8 +577,8 @@ def detect_product(sku):
     """
     if not sku:
         return "default"
-    # Direct prefix match from owner SKU_MAP
-    for prefix, product_key in SKU_MAP:
+    # Longest-prefix match — most specific entry wins over generic catch-alls like "AnyTxt"
+    for prefix, product_key in sorted(SKU_MAP, key=lambda x: -len(x[0])):
         if sku.startswith(prefix):
             return product_key
     # Keyword fallback for edge cases
@@ -718,10 +741,10 @@ def build_image_layer(img_path, w, h, sku=None):
     if bbox:
         src = src.crop(bbox)
 
-    # Scale to full zone width — height follows proportionally.
-    # Use Real-ESRGAN for large upscales (ratio >= 1.5x) for sharper output.
-    ratio = w / src.width
-    nw    = w
+    # Contain scaling: fit within zone (w × h) keeping aspect ratio.
+    # Prefer filling width, but cap height to zone height so canvas never exceeds spec.
+    ratio = min(w / src.width, h / src.height)
+    nw    = max(1, int(src.width  * ratio))
     nh    = max(1, int(src.height * ratio))
     if _ESRGAN_AVAILABLE and ratio >= _ESRGAN_MIN_RATIO:
         try:
