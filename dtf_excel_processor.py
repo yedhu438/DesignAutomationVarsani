@@ -687,21 +687,12 @@ def _pack_layer_name(name):
 
 def write_psd(out_path, canvas_w, canvas_h, layers):
     """
-    Write a layered RGB PSD (or PSB for large files) file.
-    Auto-switches to PSB when estimated size exceeds 1.5 GB.
+    Write a layered PSD file. Large orders are split upstream; never writes PSB.
     Layers: list of dicts with image/top/left/name/opacity/visible.
     """
-    # Estimate uncompressed size: canvas pixels × 4 bytes × layers
-    est_bytes = canvas_w * canvas_h * 4 * (len(layers) + 1)
-    psb = est_bytes > 1.5 * 1024**3   # use PSB if >1.5 GB estimated
-
-    if psb and out_path.endswith('.psd'):
-        out_path = out_path[:-4] + '.psb'
-
-    # PSB uses 8-byte length fields; PSD uses 4-byte
-    ch_len_fmt   = '>hQ' if psb else '>hI'   # channel data length in layer record
-    sec_len_fmt  = '>Q'  if psb else '>I'    # layer info / lmi section lengths
-    version      = 2     if psb else 1
+    ch_len_fmt = '>hI'
+    sec_len_fmt = '>I'
+    version     = 1
 
     buf = io.BytesIO()
     p   = buf.write
@@ -837,7 +828,7 @@ def _crop_dark_borders(img_rgba, dark_threshold=30, dark_ratio=0.85):
     right = w
     while right > left and is_dark_col(right - 1): right -= 1
 
-    if top > 0 or bottom < h or left > 0 or right < w:
+    if (top > 0 or bottom < h or left > 0 or right < w) and right > left and bottom > top:
         return img_rgba.crop((left, top, right, bottom))
     return img_rgba
 
@@ -865,6 +856,8 @@ def build_image_layer(img_path, w, h, do_bg_remove=False, upscale=True):
             src = src.crop(bbox)
         # Auto-crop dark letterbox borders (phone screenshots)
         src = _crop_dark_borders(src)
+    if src.width == 0 or src.height == 0:
+        return Image.new('RGBA', (max(1, w), max(1, h)), (0, 0, 0, 0)), 0, 0
     # AI upscale to canvas size, then final exact resize if needed.
     ratio_w = w / src.width
     ratio_h = h / src.height
@@ -1330,7 +1323,8 @@ def process_excel_orders(limit=None, dry_run=False, order_id=None):
 
         # Each row corresponds to one item (one SKU / OrderItemID)
         row_data = []
-        for row in rows:
+        row_data_source = []  # index into rows[] for each entry in row_data
+        for row_idx, row in enumerate(rows):
             item_id   = _safe(row.get('OrderItemID')) or ''
             row_sku   = _safe(row.get('SKU')) or sku_raw
             row_prod  = detect_product(row_sku)
@@ -1388,6 +1382,7 @@ def process_excel_orders(limit=None, dry_run=False, order_id=None):
             qty = int(row.get('Quantity', 1) or 1)
             for _ in range(qty):
                 row_data.append(zones_for_row)
+                row_data_source.append(row_idx)
 
         flat_zones = [z for zones in row_data for z in zones]
         if not flat_zones:
@@ -1451,70 +1446,75 @@ def process_excel_orders(limit=None, dry_run=False, order_id=None):
                 rendered_zones_list.append({**zone, 'zone_layers': zone_layers, 'content_h': content_h})
             rendered_rows.append(rendered_zones_list)
 
-        # ── Calculate canvas from actual content heights ─────────────────────
-        max_zw   = max(z['zw'] for zones in rendered_rows for z in zones)
-        canvas_w = PADDING + max_zw + PADDING
-        canvas_h = PADDING  # top padding only
-        for zones in rendered_rows:
-            for z in zones:
-                canvas_h += LABEL_H + z['content_h'] + GAP
-        canvas_h -= GAP        # remove trailing gap after last zone
-        canvas_h += cm(1.5)    # fixed 1.5 cm bottom margin
-        canvas_h = max(1, int(canvas_h))
-
-        # ── Place layers ────────────────────────────────────────────────────
-        # Labels go into a separate list so we can append them LAST,
-        # making them the topmost layers in Photoshop (always visible on top).
-        label_layers = []
-        y = PADDING
-        for zones in rendered_rows:
-            for zone in zones:
-                zw         = zone['zw']
-                content_h  = zone['content_h']
-                x_centre   = PADDING + (max_zw - zw) // 2
-
-                # Zone label — collected separately, added on top at the end
-                lbl     = build_label_layer(zone['label'])
-                lbl_top = y
-                label_layers.append({'name': f"{zone['label']} Label",
-                                     'image': lbl, 'top': lbl_top, 'left': x_centre,
-                                     'opacity': 255, 'visible': True})
-                img_top = y + LABEL_H
-
-                for (lname, lpil, lt, ll, lvis) in zone['zone_layers']:
-                    all_layers.append({'name': lname, 'image': lpil,
-                                       'top': img_top + lt, 'left': x_centre + ll,
-                                       'opacity': 255, 'visible': lvis})
-
-                y += LABEL_H + content_h + GAP
-
-        # Labels on top so they're never buried under content layers
-        all_layers.extend(label_layers)
-
-        # ── Write PSD ───────────────────────────────────────────────────────
+        # ── Write PSDs — one per item for multi-item orders ──────────────────
         folder_type = make_folder_type(rows, images_by_item)
         colour_sub  = sku_colour_folder(sku_raw)
-        if colour_sub:
-            cat_dir = os.path.join(out_dir, folder_type, colour_sub)
-        else:
-            cat_dir = os.path.join(out_dir, folder_type)
+        cat_dir     = os.path.join(out_dir, folder_type, colour_sub) if colour_sub else os.path.join(out_dir, folder_type)
         os.makedirs(cat_dir, exist_ok=True)
-        suffix   = f'{safe_sku}_{len(rows)}items' if len(rows) > 1 else safe_sku
-        out_path = os.path.join(cat_dir, f'{safe_id}_{suffix}.psd')
+
+        # Group rendered_rows by source row — handles Quantity > 1 stacking
+        row_groups = {}
+        for rr, src_idx in zip(rendered_rows, row_data_source):
+            row_groups.setdefault(src_idx, []).append(rr)
+
+        item_ok = True
+        for src_idx, group in row_groups.items():
+            src_row  = rows[src_idx]
+            if len(row_groups) > 1:
+                suffix = f'{src_idx + 1}of{len(row_groups)}'
+            else:
+                suffix = None
+            item_path = os.path.join(cat_dir, f'{safe_id}_{suffix}.psd' if suffix else f'{safe_id}.psd')
+
+            # Build canvas for this item (qty copies stacked)
+            max_zw_item   = max(z['zw'] for zones in group for z in zones)
+            canvas_w_item = PADDING + max_zw_item + PADDING
+            canvas_h_item = PADDING
+            for zones in group:
+                for z in zones:
+                    canvas_h_item += LABEL_H + z['content_h'] + GAP
+            canvas_h_item -= GAP
+            canvas_h_item += cm(1.5)
+            canvas_h_item = max(1, int(canvas_h_item))
+
+            item_layers  = []
+            label_layers = []
+            y = PADDING
+            for zones in group:
+                for zone in zones:
+                    zw        = zone['zw']
+                    content_h = zone['content_h']
+                    x_centre  = PADDING + (max_zw_item - zw) // 2
+                    lbl = build_label_layer(zone['label'])
+                    label_layers.append({'name': f"{zone['label']} Label",
+                                         'image': lbl, 'top': y, 'left': x_centre,
+                                         'opacity': 255, 'visible': True})
+                    img_top = y + LABEL_H
+                    for (lname, lpil, lt, ll, lvis) in zone['zone_layers']:
+                        item_layers.append({'name': lname, 'image': lpil,
+                                           'top': img_top + lt, 'left': x_centre + ll,
+                                           'opacity': 255, 'visible': lvis})
+                    y += LABEL_H + content_h + GAP
+            item_layers.extend(label_layers)
+
+            if dry_run:
+                log(f'  DRY-RUN -> {item_path}  ({len(item_layers)} layers)', 'OK')
+                continue
+
+            try:
+                write_psd(item_path, canvas_w_item, canvas_h_item, item_layers)
+                size_mb = os.path.getsize(item_path) / 1024 / 1024
+                log(f'  OK  {size_mb:.1f} MB  -> {item_path}', 'OK')
+            except Exception as e:
+                log(f'  FAIL  {e}', 'FAIL')
+                log(traceback.format_exc()[-500:], 'ERROR')
+                item_ok = False
 
         if dry_run:
-            log(f'  DRY-RUN -> {out_path}  ({len(all_layers)} layers)', 'OK')
             ok_count += 1
-            continue
-
-        try:
-            out_path = write_psd(out_path, canvas_w, canvas_h, all_layers)
-            size_mb = os.path.getsize(out_path) / 1024 / 1024
-            log(f'  OK  {size_mb:.1f} MB  -> {out_path}', 'OK')
+        elif item_ok:
             ok_count += 1
-        except Exception as e:
-            log(f'  FAIL  {e}', 'FAIL')
-            log(traceback.format_exc()[-500:], 'ERROR')
+        else:
             fail_count += 1
 
     log('=' * 60)
